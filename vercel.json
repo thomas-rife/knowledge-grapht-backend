@@ -1,22 +1,6 @@
 {
   "version": 2,
-  "builds": [
-    {
-      "src": "server.js",
-      "use": "@vercel/node"
-    }
-  ],
-  "routes": [
-    {
-      "src": "/(.*)",
-      "dest": "server.js"
-    }
-  ],
-  "functions": {
-    "server.js": {
-      "runtime": "nodejs20.x",
-      "maxDuration": 60,
-      "memory": 1024
-    }
-  }
+  "builds": [{ "src": "server.js", "use": "@vercel/node" }],
+  "routes": [{ "src": "/(.*)", "dest": "server.js" }],
+  "regions": ["sfo1"]
 }
