@@ -1503,14 +1503,6 @@ app.post("/update-node-progress", async (req, res) => {
         .from("leitner_schedule")
         .upsert(payload, { onConflict: "student_id,class_id,node_label" });
 
-      const { error: upsertErr } = await admin
-        .from("leitner_schedule")
-        .upsert(payload, { onConflict: "student_id,class_id,node_label" });
-
-      if (upsertErr) {
-        console.error("[progress] upsert failed:", upsertErr);
-      }
-
       if (upsertErr) {
         console.error("[progress] upsert failed:", upsertErr);
       }
