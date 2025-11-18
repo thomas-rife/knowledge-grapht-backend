@@ -13,6 +13,12 @@ import cors from "cors";
 const allowlist = ["http://localhost:3000", "http://localhost:3001"];
 const vercelRegex = /^https:\/\/[a-z0-9-]+\.vercel\.app$/i;
 
+console.log("[INDEX] Starting to load index.js");
+console.log("[INDEX] Env check:", {
+  hasSupabaseUrl: !!process.env.SUPABASE_URL,
+  hasGoogleKey: !!process.env.GOOGLE_API_KEY,
+});
+
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -1524,5 +1530,5 @@ app.post("/update-node-progress", async (req, res) => {
  * - /students/update/:id: update a student (PATCH)
  * - /students/:id/classes/remove: remove a class from a student (DELETE) ...probably not needed
  */
-
+console.log("[INDEX] Successfully loaded Express app");
 export default app;
