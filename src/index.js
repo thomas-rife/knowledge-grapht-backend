@@ -1505,7 +1505,7 @@ app.post("/update-node-progress", async (req, res) => {
       };
 
       // upsert on unique (student_id, class_id, node_label)
-      await admin
+      const { error: upsertErr } = await admin
         .from("leitner_schedule")
         .upsert(payload, { onConflict: "student_id,class_id,node_label" });
 
