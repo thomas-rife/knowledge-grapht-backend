@@ -30,7 +30,7 @@ app.use(
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: false,
-  })
+  }),
 );
 app.options("*", cors());
 
@@ -55,7 +55,7 @@ function extractJsonBlock(s) {
 const admin = createSupabaseAdminClient(
   process.env.SUPABASE_URL,
   process.env.SUPABASE_SERVICE_ROLE_KEY,
-  { auth: { autoRefreshToken: false, persistSession: false } }
+  { auth: { autoRefreshToken: false, persistSession: false } },
 );
 
 /**
@@ -92,7 +92,7 @@ function collectExampleTopics(examples) {
     }
   }
   return Array.from(set).sort((a, b) =>
-    a.localeCompare(b, undefined, { sensitivity: "base" })
+    a.localeCompare(b, undefined, { sensitivity: "base" }),
   );
 }
 
@@ -187,14 +187,14 @@ app.get("/public/class/:id/knowledge-graph", async (req, res) => {
   }
 });
 
+app.use("/user", verifyUser);
+
 /**
  * Test route to check if the server is running
  */
 app.get("/", async (req, res) => {
   res.status(200).send("IT WORKS 😊");
 });
-
-app.use("/user", verifyUser);
 
 /**
  * Logs the user in given the email and password
@@ -274,13 +274,13 @@ app.post("/register", async (req, res) => {
             consent: Boolean(req.body?.consent),
             over_18: Boolean(req.body?.isOver18),
           },
-          { onConflict: "student_id" }
+          { onConflict: "student_id" },
         );
 
       if (upsertErr) {
         console.error(
           "students upsert after signup failed:",
-          upsertErr.message
+          upsertErr.message,
         );
         // Do not fail registration; surface a soft warning for observability
       }
@@ -380,7 +380,7 @@ app.get("/user/enrolled-classes", async (req, res) => {
   }
 
   const classIDs = (enrolledClasses || []).map(
-    (enrollment) => enrollment.class_id
+    (enrollment) => enrollment.class_id,
   );
   if (classIDs.length === 0) return res.status(200).json([]);
 
@@ -456,7 +456,7 @@ app.get("/user/enrolled-class/:id/lessons", async (req, res) => {
       `
     lesson_id,
     lessonDetails:lessons(name, topics)
-  `
+  `,
     )
     .eq("class_id", idAsNum);
 
@@ -576,7 +576,7 @@ app.get(
         lesson_id: lessonIdNum,
       })),
     });
-  }
+  },
 );
 
 app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
@@ -669,7 +669,7 @@ app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
       }
 
       uniqueActiveTopics = new Set(
-        (activeTopics || []).flatMap((t) => t.topics)
+        (activeTopics || []).flatMap((t) => t.topics),
       );
     }
 
@@ -680,7 +680,7 @@ app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
         .schema("public")
         .from("leitner_schedule")
         .select(
-          "node_label, total_attempts, total_correct, last_reviewed, last_quiz_attempts, last_quiz_correct"
+          "node_label, total_attempts, total_correct, last_reviewed, last_quiz_attempts, last_quiz_correct, next_review",
         )
         .eq("class_id", classIdNum)
         .eq("student_id", uid);
@@ -697,6 +697,7 @@ app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
             lastReviewed: r.last_reviewed ? String(r.last_reviewed) : null,
             lastQuizAttempts: Number(r.last_quiz_attempts) || 0,
             lastQuizCorrect: Number(r.last_quiz_correct) || 0,
+            nextReview: r.next_review ? String(r.next_review) : null,
           });
         }
       }
@@ -745,10 +746,10 @@ app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
           correctResponses,
           occurrences,
           isActive,
-          // new optional fields for decay on client
           lastReviewed: t ? t.lastReviewed : null,
           lastQuizAttempts: t ? t.lastQuizAttempts : 0,
           lastQuizCorrect: t ? t.lastQuizCorrect : 0,
+          nextReview: t ? t.nextReview : null,
         };
       })
       .sort((a, b) => a.id - b.id);
@@ -956,7 +957,7 @@ app.get(
         .select("*")
         .in(
           "question_id",
-          qids.map((q) => q.question_id)
+          qids.map((q) => q.question_id),
         );
 
       if (qErr) return res.status(500).json({ error: qErr.message });
@@ -971,7 +972,7 @@ app.get(
       console.error("mobile questions route error:", e);
       return res.status(500).json({ error: "Server error" });
     }
-  }
+  },
 );
 
 // Optional query variant: /mobile/questions?class_id=..&lesson_id=..
@@ -1015,7 +1016,7 @@ app.get("/mobile/questions", verifyUser, async (req, res) => {
       .select("*")
       .in(
         "question_id",
-        qids.map((q) => q.question_id)
+        qids.map((q) => q.question_id),
       );
 
     if (qErr) return res.status(500).json({ error: qErr.message });
@@ -1034,7 +1035,7 @@ async function getLessonExamples(
   adminClient,
   classIdMaybe,
   lessonKeyMaybe,
-  limit = 3
+  limit = 3,
 ) {
   const examples = [];
   const classId = Number(classIdMaybe);
@@ -1200,12 +1201,12 @@ app.post("/llm/transform-question", async (req, res) => {
         admin,
         classIdForExamples,
         lessonForExamples,
-        3
+        3,
       );
     } catch (e) {
       console.warn(
         "[LLM EXAMPLES DEBUG] getLessonExamples failed:",
-        e?.message || e
+        e?.message || e,
       );
     }
 
@@ -1213,11 +1214,11 @@ app.post("/llm/transform-question", async (req, res) => {
       "[LLM EXAMPLES DEBUG] class_id=%s lesson_key=%s examples_count=%d",
       classIdForExamples,
       usedLessonKey,
-      Array.isArray(examples) ? examples.length : 0
+      Array.isArray(examples) ? examples.length : 0,
     );
     console.log(
       "[LLM EXAMPLES DEBUG] normalizedExamples (final, max3):",
-      examples
+      examples,
     );
 
     if (mode === "generate" && (!examples || examples.length === 0)) {
@@ -1230,13 +1231,13 @@ app.post("/llm/transform-question", async (req, res) => {
       "[LLM EXAMPLES DEBUG] source= %s, class_id=%s, lesson_key=%s",
       lessonForExamples.length ? "lesson" : "body",
       classIdForExamples,
-      lessonForExamples
+      lessonForExamples,
     );
 
     // Logs to verify the actual examples being sent
     console.log(
       "[LLM EXAMPLES DEBUG] normalizedExamples (final, max3):",
-      examples
+      examples,
     );
 
     const {
@@ -1356,7 +1357,7 @@ There are NO allowed topics. You MUST return "topics": [] in the JSON.`.trim();
     let filteredTopics = [];
     if (Array.isArray(allowedList) && allowedList.length > 0) {
       const lowerAllowed = new Map(
-        allowedList.map((t) => [t.toLowerCase(), t])
+        allowedList.map((t) => [t.toLowerCase(), t]),
       );
       const rawTopics = Array.isArray(llmJson.topics) ? llmJson.topics : [];
       filteredTopics = rawTopics
@@ -1378,7 +1379,7 @@ There are NO allowed topics. You MUST return "topics": [] in the JSON.`.trim();
     console.log(
       "[LLM EXAMPLES DEBUG] source=lesson-only class_id=%s lesson_key=%s",
       classIdForExamples,
-      usedLessonKey
+      usedLessonKey,
     );
 
     const out = {
@@ -1420,29 +1421,29 @@ There are NO allowed topics. You MUST return "topics": [] in the JSON.`.trim();
     console.error(
       "llm/transform-question error:",
       e?.message || e,
-      e?.stack ? "\\n" + e.stack.split("\\n").slice(0, 4).join("\\n") : ""
+      e?.stack ? "\\n" + e.stack.split("\\n").slice(0, 4).join("\\n") : "",
     );
     return res.status(400).json({ error: e?.message || "Bad request" });
   }
 });
 
 // POST /update-node-progress
-app.post("/update-node-progress", async (req, res) => {
+app.post("/user/update-node-progress", async (req, res) => {
+  const supabase = createClient({ req, res });
+  const {
+    data: { user },
+  } = await supabase.auth.getUser();
+  const student_id = user.id;
+
   try {
     const {
-      student_id,
       class_id,
       topics = [],
       attemptsDelta = 0,
       correctDelta = 0,
     } = req.body || {};
 
-    if (
-      !student_id ||
-      !class_id ||
-      !Array.isArray(topics) ||
-      topics.length === 0
-    ) {
+    if (!class_id || !Array.isArray(topics) || topics.length === 0) {
       return res.status(400).json({ error: "Missing required fields" });
     }
     const attDelta = Number(attemptsDelta) || 0;
@@ -1476,8 +1477,10 @@ app.post("/update-node-progress", async (req, res) => {
       let streak = existing?.streak || 0;
 
       // quiz-level outcome for this topic
-      const allCorrectThisQuiz = attDelta > 0 && corDelta === attDelta;
-      if (allCorrectThisQuiz) {
+      const quizAccuracy = attDelta > 0 ? corDelta / attDelta : 0;
+      const passed = quizAccuracy >= 0.9;
+
+      if (passed) {
         streak = streak + 1;
         box = Math.min(5, box + 1);
       } else {
@@ -1488,6 +1491,21 @@ app.post("/update-node-progress", async (req, res) => {
       const nextAttempts = prevAttempts + attDelta;
       const nextCorrect = prevCorrect + corDelta;
 
+      const getNextReviewInterval = (box, passed) => {
+        if (!passed) return 24 * 60 * 60 * 1000;
+        const intervals = [
+          1 * 24 * 60 * 60 * 1000, // Box 1
+          2 * 24 * 60 * 60 * 1000, // Box 2
+          3 * 24 * 60 * 60 * 1000, // Box 3
+          5 * 24 * 60 * 60 * 1000, // Box 4
+          7 * 24 * 60 * 60 * 1000, // Box 5
+        ];
+
+        return intervals[box - 1] || intervals[0];
+      };
+
+      const intervalMs = getNextReviewInterval(box, passed);
+
       const payload = {
         student_id,
         class_id,
@@ -1497,14 +1515,11 @@ app.post("/update-node-progress", async (req, res) => {
         last_quiz_attempts: attDelta,
         last_quiz_correct: corDelta,
         last_reviewed: new Date().toISOString(),
-        next_review: allCorrectThisQuiz
-          ? new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
-          : new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+        next_review: new Date(Date.now() + intervalMs).toISOString(),
         box,
         streak,
       };
 
-      // upsert on unique (student_id, class_id, node_label)
       const { error: upsertErr } = await admin
         .from("leitner_schedule")
         .upsert(payload, { onConflict: "student_id,class_id,node_label" });
@@ -1521,6 +1536,124 @@ app.post("/update-node-progress", async (req, res) => {
   }
 });
 
+// POST /user/lesson-complete
+// Log a completed lesson attempt as a new row for scheduling / review analysis.
+app.post("/user/lesson-complete", verifyUser, async (req, res) => {
+  try {
+    const supabase = createClient({ req, res });
+
+    const {
+      class_id,
+      lesson_id,
+      lesson_name,
+      num_questions_total,
+      num_correct,
+    } = req.body || {};
+
+    const classIdNum = Number(class_id);
+    const lessonIdNum = Number(lesson_id);
+    const totalNum = Number(num_questions_total);
+    const correctNum = Number(num_correct);
+
+    if (!Number.isFinite(classIdNum) || !Number.isFinite(lessonIdNum)) {
+      return res.status(400).json({
+        error: "class_id and lesson_id must be numbers",
+      });
+    }
+
+    if (!Number.isFinite(totalNum) || totalNum < 0) {
+      return res.status(400).json({
+        error: "num_questions_total must be a non-negative number",
+      });
+    }
+
+    if (
+      !Number.isFinite(correctNum) ||
+      correctNum < 0 ||
+      correctNum > totalNum
+    ) {
+      return res.status(400).json({
+        error: "num_correct must be between 0 and num_questions_total",
+      });
+    }
+
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabase.auth.getUser();
+
+    if (userErr || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const studentId = user.id;
+
+    // Validate enrollment
+    const { data: enrollment, error: enrollmentErr } = await supabase
+      .schema("public")
+      .from("enrollments")
+      .select("class_id")
+      .eq("class_id", classIdNum)
+      .eq("student_id", studentId)
+      .limit(1);
+
+    if (enrollmentErr) {
+      return res.status(500).json({ error: enrollmentErr.message });
+    }
+
+    if (!enrollment || enrollment.length === 0) {
+      return res.status(404).json({ error: "Not enrolled in this class" });
+    }
+
+    // Validate lesson belongs to class
+    const { data: linkRows, error: linkErr } = await supabase
+      .schema("public")
+      .from("class_lesson_bank")
+      .select("lesson_id")
+      .eq("class_id", classIdNum)
+      .eq("lesson_id", lessonIdNum)
+      .limit(1);
+
+    if (linkErr) {
+      return res.status(500).json({ error: linkErr.message });
+    }
+
+    if (!linkRows || linkRows.length === 0) {
+      return res.status(404).json({ error: "Lesson not found for class" });
+    }
+
+    const completedAt = new Date().toISOString();
+
+    const { data: inserted, error: insertErr } = await supabase
+      .schema("public")
+      .from("student_lesson_sessions")
+      .insert([
+        {
+          student_id: studentId,
+          class_id: classIdNum,
+          lesson_id: lessonIdNum,
+          num_questions_total: totalNum,
+          num_correct: correctNum,
+          completed_at: completedAt,
+        },
+      ])
+      .select("id")
+      .maybeSingle();
+
+    if (insertErr) {
+      return res.status(500).json({ error: insertErr.message });
+    }
+
+    return res.status(200).json({
+      success: true,
+      session_id: inserted?.id ?? null,
+    });
+  } catch (err) {
+    console.error("lesson-complete error:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
 /**
  * TODOs:
  * - /enroll: enroll a student in a class (POST)
@@ -1530,5 +1663,5 @@ app.post("/update-node-progress", async (req, res) => {
  * - /students/update/:id: update a student (PATCH)
  * - /students/:id/classes/remove: remove a class from a student (DELETE) ...probably not needed
  */
-console.log("[INDEX] Successfully loaded Express app");
+
 export default app;
