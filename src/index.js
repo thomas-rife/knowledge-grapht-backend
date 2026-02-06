@@ -455,22 +455,25 @@ app.get("/user/enrolled-class/:id/lessons", async (req, res) => {
     .select(
       `
     lesson_id,
-    lessonDetails:lessons(name, topics)
+    lessonDetails:lessons!inner(name, topics)
   `,
     )
-    .eq("class_id", idAsNum);
+    .eq("class_id", idAsNum)
+    .eq("lessons.is_published", true);
 
   if (lessonsError) {
     return res.status(500).json({ error: lessonsError.message });
   }
 
-  const formattedLessons = lessons.map((lesson) => {
-    return {
-      lesson_id: lesson.lesson_id,
-      name: lesson.lessonDetails.name,
-      topics: lesson.lessonDetails.topics,
-    };
-  });
+  const formattedLessons = (lessons || [])
+    .filter((lesson) => lesson && lesson.lessonDetails)
+    .map((lesson) => {
+      return {
+        lesson_id: lesson.lesson_id,
+        name: lesson.lessonDetails.name,
+        topics: lesson.lessonDetails.topics,
+      };
+    });
 
   return res.status(200).json(formattedLessons);
 });
@@ -505,7 +508,8 @@ app.get("/user/enrolled-class/:id/lesson/:lessonID", async (req, res) => {
     .schema("public")
     .from("lessons")
     .select("*")
-    .eq("lesson_id", lessonID);
+    .eq("lesson_id", lessonID)
+    .eq("lessons.is_published", true);
 
   if (lessonError) {
     return res.status(500).json({ error: lessonError.message });
@@ -539,7 +543,8 @@ app.get(
       .from("class_lesson_bank")
       .select("class_id, lesson_id")
       .eq("class_id", classIdNum)
-      .eq("lesson_id", lessonIdNum);
+      .eq("lesson_id", lessonIdNum)
+      .eq("lessons.is_published", true);
 
     if (error) {
       return res.status(500).json({ error: error.message });
