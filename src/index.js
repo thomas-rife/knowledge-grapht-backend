@@ -1085,7 +1085,7 @@ async function getLessonExamples(
       .from("lesson_question_bank")
       .select("question_id")
       .eq("lesson_id", Number(lessonId))
-      .order("question_id", { ascending: true }) // change to 'created_at' if you have that column
+      .order("question_id", { ascending: true })
       .limit(limit);
 
     if (qidErr || !idRows || idRows.length === 0) return examples;
@@ -1541,6 +1541,171 @@ app.post("/user/update-node-progress", async (req, res) => {
   }
 });
 
+function getSortedReviewEntries(review) {
+  if (!review || typeof review !== "object") return [];
+
+  return Object.entries(review)
+    .map(([topic, score]) => ({
+      topic: String(topic),
+      score: Number(score),
+    }))
+    .filter(({ topic, score }) => topic.trim() && Number.isFinite(score))
+    .sort((a, b) => b.score - a.score || a.topic.localeCompare(b.topic));
+}
+
+async function buildReviewInputsForStudent(classIdNum, studentId) {
+  const { data: classGraph, error: classGraphErr } = await admin
+    .schema("public")
+    .from("class_knowledge_graph")
+    .select("react_flow_data")
+    .eq("class_id", classIdNum)
+    .maybeSingle();
+
+  if (classGraphErr) {
+    throw new Error(classGraphErr.message);
+  }
+
+  const rf = Array.isArray(classGraph?.react_flow_data)
+    ? classGraph.react_flow_data[0]
+    : null;
+
+  const reactFlowNodes = rf?.reactFlowNodes || [];
+  const reactFlowEdges = rf?.reactFlowEdges || [];
+
+  const idToLabel = new Map();
+  for (const n of reactFlowNodes) {
+    const idNum = Number(n.id);
+    if (!Number.isFinite(idNum)) continue;
+    const label = n?.data?.label ?? String(n.id);
+    idToLabel.set(idNum, String(label));
+  }
+
+  const nodes = Array.from(idToLabel.values());
+  const edges = [];
+
+  for (const e of reactFlowEdges) {
+    const s = Number(e.source);
+    const t = Number(e.target);
+    const sl = idToLabel.get(s);
+    const tl = idToLabel.get(t);
+    if (!sl || !tl) continue;
+    edges.push([sl, tl]);
+  }
+
+  const { data: performance, error: readErr } = await admin
+    .schema("public")
+    .from("leitner_schedule")
+    .select("student_id, node_label, total_correct, total_attempts, class_id")
+    .eq("class_id", classIdNum);
+
+  if (readErr) {
+    throw new Error(readErr.message);
+  }
+
+  const studentMap = new Map();
+
+  for (const row of performance || []) {
+    const { student_id, node_label, total_attempts, total_correct } = row;
+    const sid = String(student_id);
+    const label = String(node_label || "").trim();
+    if (!sid || !label) continue;
+
+    if (!studentMap.has(sid)) {
+      studentMap.set(sid, {});
+    }
+
+    const att = Number(total_attempts) || 0;
+    const cor = Number(total_correct) || 0;
+    const mastery = att > 0 ? cor / att : 0;
+    studentMap.get(sid)[label] = mastery;
+  }
+
+  return {
+    nodes,
+    edges,
+    class_topic_progressions: Array.from(studentMap.values()),
+    student_topic_progressions: studentMap.get(studentId) || {},
+  };
+}
+
+async function fetchReviewPrioritiesForStudent(classIdNum, studentId) {
+  const base = String(process.env.KG_REVIEW_URL || "").replace(/\/?$/, "");
+  if (!base) {
+    throw new Error("Missing KG_REVIEW_URL in server environment");
+  }
+
+  const payload = await buildReviewInputsForStudent(classIdNum, studentId);
+  const ciapiResp = await fetch(`${base}/review`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (!ciapiResp.ok) {
+    const txt = await ciapiResp.text().catch(() => "");
+    const err = new Error("Review service error");
+    err.status = ciapiResp.status;
+    err.details = txt.slice(0, 800);
+    throw err;
+  }
+
+  return await ciapiResp.json();
+}
+
+async function persistReviewRecommendationSnapshot({
+  studentId,
+  classIdNum,
+  sourceLessonSessionId,
+  sourceLessonId,
+  review,
+  snapshotType = "post_lesson",
+}) {
+  const sortedEntries = getSortedReviewEntries(review);
+  const top = sortedEntries[0] || null;
+
+  const { data: snapshot, error: snapshotErr } = await admin
+    .schema("public")
+    .from("review_recommendation_snapshots")
+    .insert([
+      {
+        student_id: studentId,
+        class_id: classIdNum,
+        source_lesson_session_id: sourceLessonSessionId,
+        source_lesson_id: sourceLessonId,
+        snapshot_type: snapshotType,
+        top_topic: top?.topic ?? null,
+        top_score: top?.score ?? null,
+        review_map_json: review || {},
+      },
+    ])
+    .select("id")
+    .maybeSingle();
+
+  if (snapshotErr) {
+    throw new Error(snapshotErr.message);
+  }
+
+  if (sortedEntries.length > 0 && snapshot?.id) {
+    const topicRows = sortedEntries.map(({ topic, score }, index) => ({
+      snapshot_id: snapshot.id,
+      topic,
+      score,
+      rank: index + 1,
+    }));
+
+    const { error: topicsErr } = await admin
+      .schema("public")
+      .from("review_recommendation_topics")
+      .insert(topicRows);
+
+    if (topicsErr) {
+      throw new Error(topicsErr.message);
+    }
+  }
+
+  return snapshot?.id ?? null;
+}
+
 // POST /user/lesson-complete
 // Log a completed lesson attempt as a new row for scheduling / review analysis.
 app.post("/user/lesson-complete", verifyUser, async (req, res) => {
@@ -1649,9 +1814,35 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
       return res.status(500).json({ error: insertErr.message });
     }
 
+    let reviewSnapshotId = null;
+    let reviewSnapshotSaved = false;
+    let reviewSnapshotError = null;
+
+    try {
+      if (!inserted?.id) {
+        throw new Error("Missing lesson session id for review snapshot");
+      }
+
+      const review = await fetchReviewPrioritiesForStudent(classIdNum, studentId);
+      reviewSnapshotId = await persistReviewRecommendationSnapshot({
+        studentId,
+        classIdNum,
+        sourceLessonSessionId: inserted.id,
+        sourceLessonId: lessonIdNum,
+        review,
+      });
+      reviewSnapshotSaved = true;
+    } catch (snapshotErr) {
+      reviewSnapshotError = snapshotErr?.message || "Failed to persist review snapshot";
+      console.error("lesson-complete review snapshot error:", snapshotErr);
+    }
+
     return res.status(200).json({
       success: true,
       session_id: inserted?.id ?? null,
+      review_snapshot_saved: reviewSnapshotSaved,
+      review_snapshot_id: reviewSnapshotId,
+      review_snapshot_error: reviewSnapshotError,
     });
   } catch (err) {
     console.error("lesson-complete error:", err);
@@ -1659,6 +1850,369 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
   }
 });
 
+app.get("/user/enrolled-class/:id/review", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const classIdNum = Number(id);
+    if (!Number.isFinite(classIdNum)) {
+      return res.status(400).json({ error: "Class id must be a number" });
+    }
+
+    // Current user (student) id
+    const supabaseReq = createClient({ req, res });
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabaseReq.auth.getUser();
+    if (userErr || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+    const currentStudentID = user.id;
+    const latestSnapshot = await findLatestPostLessonSnapshot(
+      currentStudentID,
+      classIdNum,
+    );
+
+    if (!latestSnapshot?.review_map_json) {
+      return res.status(200).json({
+        class_id: classIdNum,
+        student_id: currentStudentID,
+        review: null,
+        snapshot_id: null,
+        snapshot_created_at: null,
+        top_topic: null,
+        top_score: null,
+        source: "none",
+        message:
+          "Complete a lesson first to generate a personalized review plan.",
+      });
+    }
+
+    if (latestSnapshot?.review_map_json) {
+      return res.status(200).json({
+        class_id: classIdNum,
+        student_id: currentStudentID,
+        review: latestSnapshot.review_map_json,
+        snapshot_id: latestSnapshot.id,
+        snapshot_created_at: latestSnapshot.created_at,
+        top_topic: latestSnapshot.top_topic,
+        top_score: latestSnapshot.top_score,
+        source: "snapshot",
+      });
+    }
+  } catch (e) {
+    if (e?.message === "Review service error") {
+      return res.status(502).json({
+        error: "Review service error",
+        status: e?.status ?? 500,
+        details: e?.details ?? "",
+      });
+    }
+    console.error("/user/enrolled-class/:id/review error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+function pickTopReviewTopic(review) {
+  if (!review || typeof review !== "object") return null;
+  let bestTopic = null;
+  let bestScore = -Infinity;
+  for (const [topic, score] of Object.entries(review)) {
+    const s = Number(score);
+    if (!Number.isFinite(s)) continue;
+    if (s > bestScore) {
+      bestScore = s;
+      bestTopic = topic;
+    }
+  }
+  return bestTopic ? { topic: bestTopic, score: bestScore } : null;
+}
+
+async function findLatestPostLessonSnapshot(studentId, classIdNum) {
+  const { data: snapshot, error } = await admin
+    .schema("public")
+    .from("review_recommendation_snapshots")
+    .select("id, created_at, top_topic, top_score, review_map_json")
+    .eq("student_id", studentId)
+    .eq("class_id", classIdNum)
+    .eq("snapshot_type", "post_lesson")
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  if (error) {
+    throw new Error(error.message);
+  }
+
+  return snapshot ?? null;
+}
+
+app.post("/user/enrolled-class/:id/quiz", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const classIdNum = Number(id);
+    if (!Number.isFinite(classIdNum)) {
+      return res.status(400).json({ error: "Class id must be a number" });
+    }
+
+    // Authenticated user
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabase.auth.getUser();
+    if (userErr || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    // Enrollment check
+    const { data: enrollment, error: enrollmentErr } = await supabase
+      .schema("public")
+      .from("enrollments")
+      .select("class_id")
+      .eq("class_id", classIdNum)
+      .eq("student_id", user.id)
+      .limit(1);
+
+    if (enrollmentErr) {
+      return res.status(500).json({ error: enrollmentErr.message });
+    }
+    if (!enrollment || enrollment.length === 0) {
+      return res.status(404).json({ error: "Not enrolled in this class" });
+    }
+
+    // The client should pass the review map returned by GET /user/enrolled-class/:id/review
+    // Body: { review: { [topicLabel]: number }, num_questions?: number }
+    const review = req.body?.review;
+    const top = pickTopReviewTopic(review);
+    if (!top) {
+      return res
+        .status(400)
+        .json({ error: "Missing or invalid review map in request body" });
+    }
+
+    const requestedN = Number(req.body?.num_questions);
+    const numQuestions =
+      Number.isFinite(requestedN) && requestedN > 0
+        ? Math.min(15, requestedN)
+        : 10;
+
+    // 1) Get lesson ids in this class
+    const { data: clb, error: clbErr } = await admin
+      .schema("public")
+      .from("class_lesson_bank")
+      .select("lesson_id")
+      .eq("class_id", classIdNum);
+
+    if (clbErr) {
+      return res.status(500).json({ error: clbErr.message });
+    }
+
+    const lessonIds = (clb || [])
+      .map((r) => r.lesson_id)
+      .filter((x) => Number.isFinite(Number(x)));
+    if (lessonIds.length === 0) {
+      return res.status(200).json({
+        class_id: classIdNum,
+        student_id: user.id,
+        topic: top.topic,
+        score: top.score,
+        questions: [],
+      });
+    }
+
+    // 2) Get question ids for those lessons
+    const { data: lqb, error: lqbErr } = await admin
+      .schema("public")
+      .from("lesson_question_bank")
+      .select("question_id")
+      .in("lesson_id", lessonIds);
+
+    if (lqbErr) {
+      return res.status(500).json({ error: lqbErr.message });
+    }
+
+    const qids = Array.from(
+      new Set(
+        (lqb || [])
+          .map((r) => r.question_id)
+          .filter((x) => Number.isFinite(Number(x))),
+      ),
+    );
+
+    if (qids.length === 0) {
+      return res.status(200).json({
+        class_id: classIdNum,
+        student_id: user.id,
+        topic: top.topic,
+        score: top.score,
+        questions: [],
+      });
+    }
+
+    // 3) Pull questions that include the chosen topic
+    const { data: questions, error: qErr } = await admin
+      .schema("public")
+      .from("questions")
+      .select("*")
+      .in("question_id", qids)
+      .contains("topics", [top.topic]);
+
+    if (qErr) {
+      return res.status(500).json({ error: qErr.message });
+    }
+
+    const pool = Array.isArray(questions) ? questions : [];
+
+    // Random sample without replacement
+    const shuffled = pool.slice();
+    for (let i = shuffled.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      const tmp = shuffled[i];
+      shuffled[i] = shuffled[j];
+      shuffled[j] = tmp;
+    }
+    const picked = shuffled.slice(0, Math.min(numQuestions, shuffled.length));
+
+    let reviewQuizSessionId = null;
+    if (picked.length > 0) {
+      try {
+        const latestSnapshot = await findLatestPostLessonSnapshot(
+          user.id,
+          classIdNum,
+        );
+        const questionIds = picked
+          .map((q) => q?.question_id)
+          .filter((qid) => Number.isFinite(Number(qid)));
+
+        const { data: reviewQuizSession, error: reviewQuizSessionErr } =
+          await admin
+            .schema("public")
+            .from("review_quiz_sessions")
+            .insert([
+              {
+                student_id: user.id,
+                class_id: classIdNum,
+                snapshot_id: latestSnapshot?.id ?? null,
+                topic_served: top.topic,
+                score_at_selection: top.score,
+                num_questions: picked.length,
+                question_ids_json: questionIds,
+                status: "started",
+              },
+            ])
+            .select("id")
+            .maybeSingle();
+
+        if (reviewQuizSessionErr) {
+          throw new Error(reviewQuizSessionErr.message);
+        }
+
+        reviewQuizSessionId = reviewQuizSession?.id ?? null;
+      } catch (reviewQuizSessionErr) {
+        console.error(
+          "review quiz session insert failed:",
+          reviewQuizSessionErr,
+        );
+      }
+    }
+
+    return res.status(200).json({
+      class_id: classIdNum,
+      student_id: user.id,
+      topic: top.topic,
+      score: top.score,
+      questions: picked,
+      review_quiz_session_id: reviewQuizSessionId,
+    });
+  } catch (e) {
+    console.error("/user/enrolled-class/:id/quiz error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/user/review-quiz-complete", async (req, res) => {
+  try {
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabase.auth.getUser();
+
+    if (userErr || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const reviewQuizSessionId = String(req.body?.review_quiz_session_id || "")
+      .trim();
+    const numCorrect = Number(req.body?.num_correct);
+
+    if (!reviewQuizSessionId) {
+      return res
+        .status(400)
+        .json({ error: "review_quiz_session_id is required" });
+    }
+
+    if (!Number.isFinite(numCorrect) || numCorrect < 0) {
+      return res
+        .status(400)
+        .json({ error: "num_correct must be a non-negative number" });
+    }
+
+    const { data: existingSession, error: readErr } = await admin
+      .schema("public")
+      .from("review_quiz_sessions")
+      .select("id, student_id, num_questions")
+      .eq("id", reviewQuizSessionId)
+      .maybeSingle();
+
+    if (readErr) {
+      return res.status(500).json({ error: readErr.message });
+    }
+
+    if (!existingSession) {
+      return res.status(404).json({ error: "Review quiz session not found" });
+    }
+
+    if (String(existingSession.student_id) !== String(user.id)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const totalQuestions = Number(existingSession.num_questions);
+    if (
+      !Number.isFinite(totalQuestions) ||
+      numCorrect > totalQuestions
+    ) {
+      return res.status(400).json({
+        error: "num_correct must be between 0 and num_questions",
+      });
+    }
+
+    const completedAt = new Date().toISOString();
+    const { error: updateErr } = await admin
+      .schema("public")
+      .from("review_quiz_sessions")
+      .update({
+        num_correct: numCorrect,
+        completed_at: completedAt,
+        status: "completed",
+      })
+      .eq("id", reviewQuizSessionId)
+      .eq("student_id", user.id);
+
+    if (updateErr) {
+      return res.status(500).json({ error: updateErr.message });
+    }
+
+    return res.status(200).json({
+      success: true,
+      review_quiz_session_id: reviewQuizSessionId,
+    });
+  } catch (e) {
+    console.error("/user/review-quiz-complete error:", e);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
 /**
  * TODOs:
  * - /enroll: enroll a student in a class (POST)
