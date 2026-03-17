@@ -1595,7 +1595,9 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
   const { data: performance, error: readErr } = await admin
     .schema("public")
     .from("leitner_schedule")
-    .select("student_id, node_label, total_correct, total_attempts, class_id")
+    .select(
+      "student_id, node_label, total_correct, total_attempts, last_quiz_correct, last_quiz_attempts, box, next_review, class_id",
+    )
     .eq("class_id", classIdNum);
 
   if (readErr) {
@@ -1603,6 +1605,7 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
   }
 
   const studentMap = new Map();
+  const currentStudentScheduleMeta = new Map();
 
   for (const row of performance || []) {
     const { student_id, node_label, total_attempts, total_correct } = row;
@@ -1616,8 +1619,26 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
 
     const att = Number(total_attempts) || 0;
     const cor = Number(total_correct) || 0;
-    const mastery = att > 0 ? cor / att : 0;
+    const lastAtt = Number(row.last_quiz_attempts) || 0;
+    const lastCor = Number(row.last_quiz_correct) || 0;
+
+    const cumulativeAccuracy = att > 0 ? cor / att : 0;
+    const recentAccuracy =
+      lastAtt > 0
+        ? Math.max(0, Math.min(1, lastCor / lastAtt))
+        : cumulativeAccuracy;
+
+    // Weight recent performance more heavily so recommendations react after review quizzes.
+    const mastery = 0.3 * cumulativeAccuracy + 0.7 * recentAccuracy;
+
     studentMap.get(sid)[label] = mastery;
+
+    if (sid === String(studentId)) {
+      currentStudentScheduleMeta.set(label, {
+        box: Number(row.box) || 0,
+        nextReview: row.next_review ? String(row.next_review) : null,
+      });
+    }
   }
 
   return {
@@ -1625,8 +1646,69 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
     edges,
     class_topic_progressions: Array.from(studentMap.values()),
     student_topic_progressions: studentMap.get(studentId) || {},
+    current_student_schedule_meta: currentStudentScheduleMeta,
   };
 }
+
+// async function fetchReviewPrioritiesForStudent(classIdNum, studentId) {
+//   const base = String(process.env.KG_REVIEW_URL || "").replace(/\/?$/, "");
+//   if (!base) {
+//     throw new Error("Missing KG_REVIEW_URL in server environment");
+//   }
+
+//   const payload = await buildReviewInputsForStudent(classIdNum, studentId);
+//   const {
+//     current_student_schedule_meta: currentStudentScheduleMeta,
+//     ...ciapiPayload
+//   } = payload;
+//   const ciapiResp = await fetch(`${base}/review`, {
+//     method: "POST",
+//     headers: { "Content-Type": "application/json" },
+//     body: JSON.stringify(ciapiPayload),
+//   });
+
+//   if (!ciapiResp.ok) {
+//     const txt = await ciapiResp.text().catch(() => "");
+//     const err = new Error("Review service error");
+//     err.status = ciapiResp.status;
+//     err.details = txt.slice(0, 800);
+//     throw err;
+//   }
+
+//   const review = await ciapiResp.json();
+//   const adjustedReview = {};
+//   const now = Date.now();
+
+//   for (const [topic, score] of Object.entries(review || {})) {
+//     const baseScore = Number(score);
+//     if (!Number.isFinite(baseScore)) continue;
+
+//     const meta = currentStudentScheduleMeta?.get?.(topic) || null;
+//     let multiplier = 1;
+
+//     if (meta) {
+//       const box = Number(meta.box) || 0;
+//       if (box === 1) multiplier += 0.15;
+//       else if (box === 2) multiplier += 0.08;
+
+//       const nextReviewMs = meta.nextReview
+//         ? new Date(meta.nextReview).getTime()
+//         : NaN;
+
+//       if (Number.isFinite(nextReviewMs)) {
+//         if (nextReviewMs <= now) {
+//           multiplier += 0.2;
+//         } else if (nextReviewMs - now <= 24 * 60 * 60 * 1000) {
+//           multiplier += 0.08;
+//         }
+//       }
+//     }
+
+//     adjustedReview[topic] = baseScore * multiplier;
+//   }
+
+//   return adjustedReview;
+// }
 
 async function fetchReviewPrioritiesForStudent(classIdNum, studentId) {
   const base = String(process.env.KG_REVIEW_URL || "").replace(/\/?$/, "");
@@ -1655,8 +1737,9 @@ async function fetchReviewPrioritiesForStudent(classIdNum, studentId) {
 async function persistReviewRecommendationSnapshot({
   studentId,
   classIdNum,
-  sourceLessonSessionId,
-  sourceLessonId,
+  sourceLessonSessionId = null,
+  sourceLessonId = null,
+  sourceReviewQuizSessionId = null,
   review,
   snapshotType = "post_lesson",
 }) {
@@ -1672,6 +1755,7 @@ async function persistReviewRecommendationSnapshot({
         class_id: classIdNum,
         source_lesson_session_id: sourceLessonSessionId,
         source_lesson_id: sourceLessonId,
+        source_review_quiz_session_id: sourceReviewQuizSessionId,
         snapshot_type: snapshotType,
         top_topic: top?.topic ?? null,
         top_score: top?.score ?? null,
@@ -1823,7 +1907,10 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
         throw new Error("Missing lesson session id for review snapshot");
       }
 
-      const review = await fetchReviewPrioritiesForStudent(classIdNum, studentId);
+      const review = await fetchReviewPrioritiesForStudent(
+        classIdNum,
+        studentId,
+      );
       reviewSnapshotId = await persistReviewRecommendationSnapshot({
         studentId,
         classIdNum,
@@ -1833,7 +1920,8 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
       });
       reviewSnapshotSaved = true;
     } catch (snapshotErr) {
-      reviewSnapshotError = snapshotErr?.message || "Failed to persist review snapshot";
+      reviewSnapshotError =
+        snapshotErr?.message || "Failed to persist review snapshot";
       console.error("lesson-complete review snapshot error:", snapshotErr);
     }
 
@@ -1868,7 +1956,7 @@ app.get("/user/enrolled-class/:id/review", async (req, res) => {
       return res.status(401).json({ error: "Not logged in." });
     }
     const currentStudentID = user.id;
-    const latestSnapshot = await findLatestPostLessonSnapshot(
+    const latestSnapshot = await findLatestRecommendationSnapshot(
       currentStudentID,
       classIdNum,
     );
@@ -1928,14 +2016,13 @@ function pickTopReviewTopic(review) {
   return bestTopic ? { topic: bestTopic, score: bestScore } : null;
 }
 
-async function findLatestPostLessonSnapshot(studentId, classIdNum) {
+async function findLatestRecommendationSnapshot(studentId, classIdNum) {
   const { data: snapshot, error } = await admin
     .schema("public")
     .from("review_recommendation_snapshots")
     .select("id, created_at, top_topic, top_score, review_map_json")
     .eq("student_id", studentId)
     .eq("class_id", classIdNum)
-    .eq("snapshot_type", "post_lesson")
     .order("created_at", { ascending: false })
     .limit(1)
     .maybeSingle();
@@ -2077,7 +2164,7 @@ app.post("/user/enrolled-class/:id/quiz", async (req, res) => {
     let reviewQuizSessionId = null;
     if (picked.length > 0) {
       try {
-        const latestSnapshot = await findLatestPostLessonSnapshot(
+        const latestSnapshot = await findLatestRecommendationSnapshot(
           user.id,
           classIdNum,
         );
@@ -2143,8 +2230,9 @@ app.post("/user/review-quiz-complete", async (req, res) => {
       return res.status(401).json({ error: "Not logged in." });
     }
 
-    const reviewQuizSessionId = String(req.body?.review_quiz_session_id || "")
-      .trim();
+    const reviewQuizSessionId = String(
+      req.body?.review_quiz_session_id || "",
+    ).trim();
     const numCorrect = Number(req.body?.num_correct);
 
     if (!reviewQuizSessionId) {
@@ -2162,7 +2250,7 @@ app.post("/user/review-quiz-complete", async (req, res) => {
     const { data: existingSession, error: readErr } = await admin
       .schema("public")
       .from("review_quiz_sessions")
-      .select("id, student_id, num_questions")
+      .select("id, student_id, num_questions, class_id")
       .eq("id", reviewQuizSessionId)
       .maybeSingle();
 
@@ -2179,10 +2267,7 @@ app.post("/user/review-quiz-complete", async (req, res) => {
     }
 
     const totalQuestions = Number(existingSession.num_questions);
-    if (
-      !Number.isFinite(totalQuestions) ||
-      numCorrect > totalQuestions
-    ) {
+    if (!Number.isFinite(totalQuestions) || numCorrect > totalQuestions) {
       return res.status(400).json({
         error: "num_correct must be between 0 and num_questions",
       });
@@ -2204,9 +2289,37 @@ app.post("/user/review-quiz-complete", async (req, res) => {
       return res.status(500).json({ error: updateErr.message });
     }
 
+    let reviewSnapshotId = null;
+    let reviewSnapshotSaved = false;
+    let reviewSnapshotError = null;
+
+    try {
+      const classIdNum = Number(existingSession.class_id);
+      if (!Number.isFinite(classIdNum)) {
+        throw new Error("Review quiz session is missing a valid class_id");
+      }
+
+      const review = await fetchReviewPrioritiesForStudent(classIdNum, user.id);
+      reviewSnapshotId = await persistReviewRecommendationSnapshot({
+        studentId: user.id,
+        classIdNum,
+        sourceReviewQuizSessionId: reviewQuizSessionId,
+        review,
+        snapshotType: "post_review_quiz",
+      });
+      reviewSnapshotSaved = true;
+    } catch (snapshotErr) {
+      reviewSnapshotError =
+        snapshotErr?.message || "Failed to persist post-review snapshot";
+      console.error("review-quiz-complete snapshot error:", snapshotErr);
+    }
+
     return res.status(200).json({
       success: true,
       review_quiz_session_id: reviewQuizSessionId,
+      review_snapshot_saved: reviewSnapshotSaved,
+      review_snapshot_id: reviewSnapshotId,
+      review_snapshot_error: reviewSnapshotError,
     });
   } catch (e) {
     console.error("/user/review-quiz-complete error:", e);
