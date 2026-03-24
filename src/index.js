@@ -1925,6 +1925,16 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
       console.error("lesson-complete review snapshot error:", snapshotErr);
     }
 
+    console.log("lesson-complete snapshot status", {
+      classId: classIdNum,
+      lessonId: lessonIdNum,
+      studentId,
+      sessionId: inserted?.id ?? null,
+      reviewSnapshotSaved,
+      reviewSnapshotId,
+      reviewSnapshotError,
+    });
+
     return res.status(200).json({
       success: true,
       session_id: inserted?.id ?? null,
@@ -2313,6 +2323,15 @@ app.post("/user/review-quiz-complete", async (req, res) => {
         snapshotErr?.message || "Failed to persist post-review snapshot";
       console.error("review-quiz-complete snapshot error:", snapshotErr);
     }
+
+    console.log("review-quiz-complete snapshot status", {
+      classId: Number(existingSession.class_id),
+      studentId: user.id,
+      reviewQuizSessionId,
+      reviewSnapshotSaved,
+      reviewSnapshotId,
+      reviewSnapshotError,
+    });
 
     return res.status(200).json({
       success: true,
