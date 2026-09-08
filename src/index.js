@@ -14,6 +14,10 @@ import {
   normalizeQuizMode,
   validateCompletionCounts,
 } from "./quizSessions.js";
+import {
+  buildProgressSummary,
+  buildTopicPerformance,
+} from "./progress.js";
 // import scheduler from '../routes/schedule.js'
 // import progressRouter from '../routes/progress.js'
 
@@ -2344,6 +2348,124 @@ app.get("/user/enrolled-class/:id/today", async (req, res) => {
     });
   } catch (error) {
     console.error("/user/enrolled-class/:id/today error:", error);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+async function fetchAllProgressRows(buildPage, pageSize = 1000) {
+  const rows = [];
+  let from = 0;
+
+  while (true) {
+    const { data, error } = await buildPage(from, from + pageSize - 1);
+    if (error) throw new Error(error.message);
+    const page = data || [];
+    rows.push(...page);
+    if (page.length < pageSize) return rows;
+    from += pageSize;
+  }
+}
+
+app.get("/user/enrolled-class/:id/progress", async (req, res) => {
+  try {
+    const classIdNum = Number(req.params.id);
+    if (!Number.isFinite(classIdNum)) {
+      return res.status(400).json({ error: "Class id must be a number" });
+    }
+
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabase.auth.getUser();
+    if (userErr || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const { data: enrollment, error: enrollmentErr } = await supabase
+      .schema("public")
+      .from("enrollments")
+      .select("class_id")
+      .eq("class_id", classIdNum)
+      .eq("student_id", user.id)
+      .limit(1);
+    if (enrollmentErr) {
+      return res.status(500).json({ error: enrollmentErr.message });
+    }
+    if (!enrollment?.length) {
+      return res.status(404).json({ error: "Not enrolled in this class" });
+    }
+
+    const [classResult, sessions, answers] = await Promise.all([
+      admin
+        .schema("public")
+        .from("classes")
+        .select("class_id, name")
+        .eq("class_id", classIdNum)
+        .maybeSingle(),
+      fetchAllProgressRows((from, to) =>
+        admin
+          .schema("public")
+          .from("quiz_sessions")
+          .select(
+            "id, quiz_mode, status, focus_topic_label, question_count, answered_count, correct_count, started_at, last_activity_at, completed_at, ended_at",
+          )
+          .eq("student_id", user.id)
+          .eq("class_id", classIdNum)
+          .order("started_at", { ascending: false })
+          .range(from, to),
+      ),
+      fetchAllProgressRows((from, to) =>
+        admin
+          .schema("public")
+          .from("student_question_answers")
+          .select("quiz_session_id, question_id, is_correct, answered_at")
+          .eq("student_id", user.id)
+          .eq("class_id", classIdNum)
+          .not("quiz_session_id", "is", null)
+          .order("answered_at", { ascending: true })
+          .range(from, to),
+      ),
+    ]);
+
+    if (classResult.error) throw new Error(classResult.error.message);
+
+    const sessionIds = sessions.map((session) => session.id).filter(Boolean);
+    const questionBatches = [];
+    for (let index = 0; index < sessionIds.length; index += 25) {
+      const batchIds = sessionIds.slice(index, index + 25);
+      questionBatches.push(
+        fetchAllProgressRows((from, to) =>
+          admin
+            .schema("public")
+            .from("quiz_session_questions")
+            .select("quiz_session_id, question_id, question_snapshot")
+            .in("quiz_session_id", batchIds)
+            .range(from, to),
+        ),
+      );
+    }
+
+    const issuedQuestions = (await Promise.all(questionBatches)).flat();
+
+    const timeZone = normalizeTimeZone(req.query?.timezone);
+    const progress = buildProgressSummary(sessions, timeZone);
+    const topicPerformance = buildTopicPerformance(
+      answers,
+      issuedQuestions,
+    );
+
+    return res.status(200).json({
+      contract_version: "2026-09-08",
+      class: {
+        id: classIdNum,
+        name: classResult.data?.name || `Class ${classIdNum}`,
+      },
+      ...progress,
+      topic_performance: topicPerformance,
+    });
+  } catch (error) {
+    console.error("/user/enrolled-class/:id/progress error:", error);
     return res.status(500).json({ error: "Server error" });
   }
 });
