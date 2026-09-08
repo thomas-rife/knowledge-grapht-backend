@@ -22,7 +22,14 @@ topic/recommendation context for review practice. The response includes a
 
 Complete it with `POST /user/quiz-sessions/:sessionId/complete`. Completion is
 idempotent and only succeeds when `answered_count` equals the question count
-recorded at session creation.
+recorded at session creation. A successful first completion generates a new
+recommendation snapshot whose `snapshot_type` identifies the completed mode:
+
+| `quiz_mode` | `snapshot_type` |
+| --- | --- |
+| `lesson` | `post_lesson` |
+| `daily_review` | `post_daily_review` |
+| `topic_practice` | `post_topic_practice` |
 
 Abandon an unfinished quiz with `POST /user/quiz-sessions/:sessionId/abandon`.
 The server derives `answered_count` and `correct_count` from persisted answers,

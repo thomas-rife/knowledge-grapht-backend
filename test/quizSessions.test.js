@@ -2,9 +2,11 @@ import { describe, it } from "node:test";
 import { deepEqual, equal } from "node:assert/strict";
 import {
   QUIZ_MODES,
+  SNAPSHOT_TYPES,
   buildSessionQuestionRows,
   normalizeLaunchSource,
   normalizeQuizMode,
+  snapshotTypeForQuizMode,
   validateCompletionCounts,
 } from "../src/quizSessions.js";
 
@@ -18,6 +20,22 @@ describe("Unified quiz-session contract", () => {
   it("keeps launch source separate from quiz mode", () => {
     equal(normalizeLaunchSource("notification", QUIZ_MODES.DAILY_REVIEW), "notification");
     equal(normalizeLaunchSource("", QUIZ_MODES.TOPIC_PRACTICE), "graph_node");
+  });
+
+  it("records a distinct recommendation snapshot type for every quiz mode", () => {
+    equal(
+      snapshotTypeForQuizMode(QUIZ_MODES.LESSON),
+      SNAPSHOT_TYPES.POST_LESSON,
+    );
+    equal(
+      snapshotTypeForQuizMode(QUIZ_MODES.DAILY_REVIEW),
+      SNAPSHOT_TYPES.POST_DAILY_REVIEW,
+    );
+    equal(
+      snapshotTypeForQuizMode(QUIZ_MODES.TOPIC_PRACTICE),
+      SNAPSHOT_TYPES.POST_TOPIC_PRACTICE,
+    );
+    equal(snapshotTypeForQuizMode("legacy_review"), null);
   });
 
   it("captures the issued question state for reproducible sessions", () => {

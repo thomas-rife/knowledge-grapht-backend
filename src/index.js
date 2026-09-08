@@ -12,6 +12,7 @@ import {
   buildSessionQuestionRows,
   normalizeLaunchSource,
   normalizeQuizMode,
+  snapshotTypeForQuizMode,
   validateCompletionCounts,
 } from "./quizSessions.js";
 import {
@@ -2868,6 +2869,15 @@ app.post("/user/quiz-sessions/:sessionId/complete", async (req, res) => {
 
     if (!alreadyCompleted) {
       try {
+        const snapshotType = snapshotTypeForQuizMode(
+          existingSession.quiz_mode,
+        );
+        if (!snapshotType) {
+          throw new Error(
+            `Unsupported quiz mode for recommendation snapshot: ${existingSession.quiz_mode}`,
+          );
+        }
+
         const review = await fetchReviewPrioritiesForStudent(
           Number(existingSession.class_id),
           user.id,
@@ -2878,10 +2888,7 @@ app.post("/user/quiz-sessions/:sessionId/complete", async (req, res) => {
           sourceQuizSessionId: quizSessionId,
           sourceLessonId: existingSession.lesson_id,
           review,
-          snapshotType:
-            existingSession.quiz_mode === QUIZ_MODES.LESSON
-              ? "post_lesson"
-              : "post_review_quiz",
+          snapshotType,
         });
         reviewSnapshotSaved = true;
       } catch (snapshotError) {

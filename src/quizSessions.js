@@ -4,6 +4,12 @@ export const QUIZ_MODES = Object.freeze({
   TOPIC_PRACTICE: "topic_practice",
 });
 
+export const SNAPSHOT_TYPES = Object.freeze({
+  POST_LESSON: "post_lesson",
+  POST_DAILY_REVIEW: "post_daily_review",
+  POST_TOPIC_PRACTICE: "post_topic_practice",
+});
+
 const launchSources = new Set([
   "today",
   "lesson_screen",
@@ -25,6 +31,17 @@ export function normalizeLaunchSource(value, quizMode) {
   if (quizMode === QUIZ_MODES.DAILY_REVIEW) return "today";
   if (quizMode === QUIZ_MODES.TOPIC_PRACTICE) return "graph_node";
   return "unknown";
+}
+
+export function snapshotTypeForQuizMode(quizMode) {
+  if (quizMode === QUIZ_MODES.LESSON) return SNAPSHOT_TYPES.POST_LESSON;
+  if (quizMode === QUIZ_MODES.DAILY_REVIEW) {
+    return SNAPSHOT_TYPES.POST_DAILY_REVIEW;
+  }
+  if (quizMode === QUIZ_MODES.TOPIC_PRACTICE) {
+    return SNAPSHOT_TYPES.POST_TOPIC_PRACTICE;
+  }
+  return null;
 }
 
 export function buildSessionQuestionRows(questions) {

@@ -22,7 +22,9 @@ export function dateKeyForInstant(instant, timeZone = "UTC") {
     month: "2-digit",
     day: "2-digit",
   }).formatToParts(date);
-  const byType = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  const byType = Object.fromEntries(
+    parts.map((part) => [part.type, part.value]),
+  );
   return `${byType.year}-${byType.month}-${byType.day}`;
 }
 
@@ -33,7 +35,11 @@ export function shiftDateKey(dateKey, deltaDays) {
   return shifted.toISOString().slice(0, 10);
 }
 
-export function buildStreakSummary(completedAtValues, timeZone, now = new Date()) {
+export function buildStreakSummary(
+  completedAtValues,
+  timeZone,
+  now = new Date(),
+) {
   const normalizedTimeZone = normalizeTimeZone(timeZone);
   const activityCounts = new Map();
 
@@ -46,7 +52,11 @@ export function buildStreakSummary(completedAtValues, timeZone, now = new Date()
   const today = dateKeyForInstant(now, normalizedTimeZone);
   const yesterday = shiftDateKey(today, -1);
   const studiedToday = activityCounts.has(today);
-  let cursor = studiedToday ? today : activityCounts.has(yesterday) ? yesterday : null;
+  let cursor = studiedToday
+    ? today
+    : activityCounts.has(yesterday)
+      ? yesterday
+      : null;
   let currentStreak = 0;
 
   while (cursor && activityCounts.has(cursor)) {
