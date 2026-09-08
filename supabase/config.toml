@@ -1,0 +1,11 @@
+project_id = "knowledge-grapht-backend"
+
+[db]
+major_version = 15
+
+[db.migrations]
+enabled = true
+schema_paths = []
+
+[db.seed]
+enabled = false

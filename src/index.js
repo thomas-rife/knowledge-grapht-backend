@@ -2,6 +2,18 @@ import express from "express";
 import { createClient } from "../util/subabase.js";
 import { createClient as createSupabaseAdminClient } from "@supabase/supabase-js";
 import { GoogleGenerativeAI } from "@google/generative-ai";
+import {
+  buildDeterministicRecommendationExplanation,
+  buildStreakSummary,
+  normalizeTimeZone,
+} from "./today.js";
+import {
+  QUIZ_MODES,
+  buildSessionQuestionRows,
+  normalizeLaunchSource,
+  normalizeQuizMode,
+  validateCompletionCounts,
+} from "./quizSessions.js";
 // import scheduler from '../routes/schedule.js'
 // import progressRouter from '../routes/progress.js'
 
@@ -1553,6 +1565,156 @@ function getSortedReviewEntries(review) {
     .sort((a, b) => b.score - a.score || a.topic.localeCompare(b.topic));
 }
 
+async function getClassTopicContext(classIdNum, requestedTopic = null) {
+  const { data: classGraph, error } = await admin
+    .schema("public")
+    .from("class_knowledge_graph")
+    .select("react_flow_data")
+    .eq("class_id", classIdNum)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+
+  const rf = Array.isArray(classGraph?.react_flow_data)
+    ? classGraph.react_flow_data[0]
+    : null;
+  const graphNodes = Array.isArray(rf?.reactFlowNodes)
+    ? rf.reactFlowNodes
+    : [];
+  const graphEdges = Array.isArray(rf?.reactFlowEdges)
+    ? rf.reactFlowEdges
+    : [];
+  const idToLabel = new Map();
+
+  for (const node of graphNodes) {
+    const id = String(node?.id ?? "");
+    const label = String(node?.data?.label ?? "").trim();
+    if (id && label) idToLabel.set(id, label);
+  }
+
+  if (!requestedTopic) {
+    return { labels: Array.from(idToLabel.values()) };
+  }
+
+  const normalizedRequest = String(requestedTopic).trim().toLocaleLowerCase();
+  const topic = Array.from(idToLabel.values()).find(
+    (label) => label.toLocaleLowerCase() === normalizedRequest,
+  );
+  if (!topic) return null;
+
+  const topicIds = new Set(
+    Array.from(idToLabel.entries())
+      .filter(([, label]) => label === topic)
+      .map(([id]) => id),
+  );
+  const prerequisites = [];
+  const supports = [];
+
+  for (const edge of graphEdges) {
+    const source = String(edge?.source ?? "");
+    const target = String(edge?.target ?? "");
+    if (topicIds.has(target) && idToLabel.has(source)) {
+      prerequisites.push(idToLabel.get(source));
+    }
+    if (topicIds.has(source) && idToLabel.has(target)) {
+      supports.push(idToLabel.get(target));
+    }
+  }
+
+  return {
+    nodeId: Array.from(topicIds)[0] ?? null,
+    topic,
+    prerequisites: Array.from(new Set(prerequisites)),
+    supports: Array.from(new Set(supports)),
+  };
+}
+
+async function getStudyStreak(studentId, classIdNum, timeZone) {
+  const { data, error } = await admin
+    .schema("public")
+    .from("quiz_sessions")
+    .select("completed_at")
+    .eq("student_id", studentId)
+    .eq("class_id", classIdNum)
+    .eq("status", "completed")
+    .not("completed_at", "is", null)
+    .order("completed_at", { ascending: false })
+    .limit(500);
+
+  if (error) throw new Error(error.message);
+
+  const completedAtValues = (data || []).map((row) => row.completed_at);
+  return buildStreakSummary(completedAtValues, timeZone);
+}
+
+async function getStudyStreakSafe(studentId, classIdNum, timeZone) {
+  try {
+    return await getStudyStreak(studentId, classIdNum, timeZone);
+  } catch (error) {
+    console.warn("Unable to load study streak:", error?.message || error);
+    return null;
+  }
+}
+
+const todayExplanationCache = new Map();
+
+async function getRecommendationExplanation({
+  snapshotId,
+  topic,
+  prerequisites,
+  supports,
+  dueStatus,
+}) {
+  const fallback = buildDeterministicRecommendationExplanation({
+    topic,
+    prerequisites,
+    supports,
+    dueStatus,
+  });
+  if (!process.env.GOOGLE_API_KEY) {
+    return { text: fallback, source: "deterministic" };
+  }
+
+  const cacheKey = `${snapshotId || "none"}:${topic}:${dueStatus}`;
+  const cached = todayExplanationCache.get(cacheKey);
+  if (cached) return cached;
+
+  try {
+    const genAI = new GoogleGenerativeAI(process.env.GOOGLE_API_KEY);
+    const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+    const prompt = [
+      "Write a concise recommendation explaining why a student should review a course topic today.",
+      "Use only the JSON facts below. Do not infer grades, ability, or personal traits.",
+      "Write two plain-text sentences, no heading, no markdown, maximum 55 words.",
+      "Sentence one explains why now. Sentence two explains what this topic unlocks or reinforces.",
+      `Facts: ${JSON.stringify({ topic, dueStatus, prerequisites, supports })}`,
+    ].join("\n");
+    const result = await Promise.race([
+      model.generateContent(prompt),
+      new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Gemini explanation timed out")), 5000),
+      ),
+    ]);
+    const response = await result.response;
+    const text = String(response.text() || "")
+      .replace(/```/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 500);
+    if (!text) throw new Error("Gemini returned an empty explanation");
+
+    const generated = { text, source: "gemini" };
+    todayExplanationCache.set(cacheKey, generated);
+    if (todayExplanationCache.size > 250) {
+      todayExplanationCache.delete(todayExplanationCache.keys().next().value);
+    }
+    return generated;
+  } catch (error) {
+    console.warn("Today explanation fallback:", error?.message || error);
+    return { text: fallback, source: "deterministic" };
+  }
+}
+
 async function buildReviewInputsForStudent(classIdNum, studentId) {
   const { data: classGraph, error: classGraphErr } = await admin
     .schema("public")
@@ -1740,6 +1902,7 @@ async function persistReviewRecommendationSnapshot({
   sourceLessonSessionId = null,
   sourceLessonId = null,
   sourceReviewQuizSessionId = null,
+  sourceQuizSessionId = null,
   review,
   snapshotType = "post_lesson",
 }) {
@@ -1756,6 +1919,7 @@ async function persistReviewRecommendationSnapshot({
         source_lesson_session_id: sourceLessonSessionId,
         source_lesson_id: sourceLessonId,
         source_review_quiz_session_id: sourceReviewQuizSessionId,
+        source_quiz_session_id: sourceQuizSessionId,
         snapshot_type: snapshotType,
         top_topic: top?.topic ?? null,
         top_score: top?.score ?? null,
@@ -1802,6 +1966,7 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
       lesson_name,
       num_questions_total,
       num_correct,
+      timezone,
     } = req.body || {};
 
     const classIdNum = Number(class_id);
@@ -1935,12 +2100,19 @@ app.post("/user/lesson-complete", verifyUser, async (req, res) => {
       reviewSnapshotError,
     });
 
+    const streak = await getStudyStreakSafe(
+      studentId,
+      classIdNum,
+      normalizeTimeZone(timezone),
+    );
+
     return res.status(200).json({
       success: true,
       session_id: inserted?.id ?? null,
       review_snapshot_saved: reviewSnapshotSaved,
       review_snapshot_id: reviewSnapshotId,
       review_snapshot_error: reviewSnapshotError,
+      streak,
     });
   } catch (err) {
     console.error("lesson-complete error:", err);
@@ -2044,6 +2216,632 @@ async function findLatestRecommendationSnapshot(studentId, classIdNum) {
   return snapshot ?? null;
 }
 
+app.get("/user/enrolled-class/:id/today", async (req, res) => {
+  try {
+    const classIdNum = Number(req.params.id);
+    if (!Number.isFinite(classIdNum)) {
+      return res.status(400).json({ error: "Class id must be a number" });
+    }
+
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userErr,
+    } = await supabase.auth.getUser();
+    if (userErr || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const { data: enrollment, error: enrollmentErr } = await supabase
+      .schema("public")
+      .from("enrollments")
+      .select("class_id")
+      .eq("class_id", classIdNum)
+      .eq("student_id", user.id)
+      .limit(1);
+    if (enrollmentErr) {
+      return res.status(500).json({ error: enrollmentErr.message });
+    }
+    if (!enrollment?.length) {
+      return res.status(404).json({ error: "Not enrolled in this class" });
+    }
+
+    const timeZone = normalizeTimeZone(req.query?.timezone);
+    const [classResult, latestSnapshot, streak] = await Promise.all([
+      admin
+        .schema("public")
+        .from("classes")
+        .select("class_id, name")
+        .eq("class_id", classIdNum)
+        .maybeSingle(),
+      findLatestRecommendationSnapshot(user.id, classIdNum),
+      getStudyStreak(user.id, classIdNum, timeZone),
+    ]);
+    if (classResult.error) throw new Error(classResult.error.message);
+
+    const rankedTopics = getSortedReviewEntries(
+      latestSnapshot?.review_map_json,
+    ).slice(0, 3);
+    const top = rankedTopics[0] || null;
+    let recommendation = null;
+
+    if (top) {
+      const [topicContext, scheduleResult] = await Promise.all([
+        getClassTopicContext(classIdNum, top.topic),
+        admin
+          .schema("public")
+          .from("leitner_schedule")
+          .select(
+            "box, next_review, last_reviewed, total_correct, total_attempts",
+          )
+          .eq("student_id", user.id)
+          .eq("class_id", classIdNum)
+          .eq("node_label", top.topic)
+          .maybeSingle(),
+      ]);
+      if (scheduleResult.error) throw new Error(scheduleResult.error.message);
+
+      const nextReviewMs = scheduleResult.data?.next_review
+        ? new Date(scheduleResult.data.next_review).getTime()
+        : NaN;
+      const dueStatus = Number.isFinite(nextReviewMs)
+        ? nextReviewMs < Date.now()
+          ? "overdue"
+          : nextReviewMs - Date.now() < 24 * 60 * 60 * 1000
+            ? "due_today"
+            : "recommended"
+        : "recommended";
+      const prerequisites = topicContext?.prerequisites || [];
+      const supports = topicContext?.supports || [];
+      const explanation = await getRecommendationExplanation({
+        snapshotId: latestSnapshot.id,
+        topic: topicContext?.topic || top.topic,
+        prerequisites,
+        supports,
+        dueStatus,
+      });
+
+      recommendation = {
+        topic: topicContext?.topic || top.topic,
+        priority_score: top.score,
+        due_status: dueStatus,
+        next_review: scheduleResult.data?.next_review || null,
+        last_reviewed: scheduleResult.data?.last_reviewed || null,
+        prerequisites,
+        supports,
+        explanation: explanation.text,
+        explanation_source: explanation.source,
+        quiz: {
+          question_type: "multiple-choice",
+          requested_questions: 10,
+        },
+      };
+    }
+
+    return res.status(200).json({
+      contract_version: "2026-09-04",
+      class: {
+        id: classIdNum,
+        name: classResult.data?.name || `Class ${classIdNum}`,
+      },
+      daily_goal: {
+        kind: "quiz_completion",
+        required: 1,
+        completed: streak.studied_today ? 1 : 0,
+      },
+      streak,
+      recommendation,
+      priorities: rankedTopics.map(({ topic, score }) => ({ topic, score })),
+      recommendation_snapshot: latestSnapshot
+        ? {
+            id: latestSnapshot.id,
+            created_at: latestSnapshot.created_at,
+          }
+        : null,
+      message: recommendation
+        ? null
+        : "Complete a lesson quiz to create your first personalized review.",
+    });
+  } catch (error) {
+    console.error("/user/enrolled-class/:id/today error:", error);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+async function validateQuizEnrollment(studentId, classIdNum) {
+  const { data, error } = await admin
+    .schema("public")
+    .from("enrollments")
+    .select("class_id")
+    .eq("class_id", classIdNum)
+    .eq("student_id", studentId)
+    .limit(1);
+
+  if (error) throw new Error(error.message);
+  return Array.isArray(data) && data.length > 0;
+}
+
+async function fetchQuestionsByIds(questionIds) {
+  const orderedIds = Array.from(
+    new Set(
+      (questionIds || [])
+        .map((questionId) => Number(questionId))
+        .filter(Number.isFinite),
+    ),
+  );
+  if (orderedIds.length === 0) return [];
+
+  const { data, error } = await admin
+    .schema("public")
+    .from("questions")
+    .select("*")
+    .in("question_id", orderedIds);
+
+  if (error) throw new Error(error.message);
+
+  const byId = new Map(
+    (data || []).map((question) => [Number(question.question_id), question]),
+  );
+  return orderedIds.map((questionId) => byId.get(questionId)).filter(Boolean);
+}
+
+async function buildLessonQuiz(classIdNum, lessonIdNum) {
+  const { data: lessonLink, error: lessonLinkError } = await admin
+    .schema("public")
+    .from("class_lesson_bank")
+    .select("lesson_id")
+    .eq("class_id", classIdNum)
+    .eq("lesson_id", lessonIdNum)
+    .limit(1);
+
+  if (lessonLinkError) throw new Error(lessonLinkError.message);
+  if (!lessonLink?.length) {
+    const error = new Error("Lesson not found for class");
+    error.status = 404;
+    throw error;
+  }
+
+  const { data: questionLinks, error: questionLinksError } = await admin
+    .schema("public")
+    .from("lesson_question_bank")
+    .select("question_id")
+    .eq("lesson_id", lessonIdNum);
+
+  if (questionLinksError) throw new Error(questionLinksError.message);
+
+  const questions = await fetchQuestionsByIds(
+    (questionLinks || []).map((row) => row.question_id),
+  );
+  return questions.map((question) => ({ ...question, lesson_id: lessonIdNum }));
+}
+
+async function findRecommendationSnapshot(
+  studentId,
+  classIdNum,
+  recommendationSnapshotId,
+) {
+  if (!recommendationSnapshotId) {
+    return await findLatestRecommendationSnapshot(studentId, classIdNum);
+  }
+
+  const { data, error } = await admin
+    .schema("public")
+    .from("review_recommendation_snapshots")
+    .select("id, created_at, top_topic, top_score, review_map_json")
+    .eq("id", recommendationSnapshotId)
+    .eq("student_id", studentId)
+    .eq("class_id", classIdNum)
+    .maybeSingle();
+
+  if (error) throw new Error(error.message);
+  return data ?? null;
+}
+
+async function buildTopicQuiz(classIdNum, topic, requestedQuestionCount) {
+  const topicContext = await getClassTopicContext(classIdNum, topic);
+  if (!topicContext?.topic) {
+    const error = new Error(
+      "The requested topic is not part of this class knowledge graph",
+    );
+    error.status = 400;
+    throw error;
+  }
+
+  const { data: classLessons, error: classLessonsError } = await admin
+    .schema("public")
+    .from("class_lesson_bank")
+    .select("lesson_id")
+    .eq("class_id", classIdNum);
+
+  if (classLessonsError) throw new Error(classLessonsError.message);
+
+  const lessonIds = (classLessons || [])
+    .map((row) => Number(row.lesson_id))
+    .filter(Number.isFinite);
+  if (lessonIds.length === 0) return { topicContext, questions: [] };
+
+  const { data: questionLinks, error: questionLinksError } = await admin
+    .schema("public")
+    .from("lesson_question_bank")
+    .select("question_id")
+    .in("lesson_id", lessonIds);
+
+  if (questionLinksError) throw new Error(questionLinksError.message);
+
+  const questionIds = Array.from(
+    new Set(
+      (questionLinks || [])
+        .map((row) => Number(row.question_id))
+        .filter(Number.isFinite),
+    ),
+  );
+  if (questionIds.length === 0) return { topicContext, questions: [] };
+
+  const { data: topicQuestions, error: topicQuestionsError } = await admin
+    .schema("public")
+    .from("questions")
+    .select("*")
+    .in("question_id", questionIds)
+    .contains("topics", [topicContext.topic]);
+
+  if (topicQuestionsError) throw new Error(topicQuestionsError.message);
+
+  const shuffled = Array.isArray(topicQuestions) ? topicQuestions.slice() : [];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const swapIndex = Math.floor(Math.random() * (index + 1));
+    [shuffled[index], shuffled[swapIndex]] = [
+      shuffled[swapIndex],
+      shuffled[index],
+    ];
+  }
+
+  return {
+    topicContext,
+    questions: shuffled.slice(
+      0,
+      Math.min(requestedQuestionCount, shuffled.length),
+    ),
+  };
+}
+
+async function createUnifiedQuizSession({
+  studentId,
+  classIdNum,
+  quizMode,
+  launchSource,
+  questions,
+  lessonId = null,
+  focusNodeId = null,
+  focusTopicLabel = null,
+  recommendationSnapshotId = null,
+  scoreAtSelection = null,
+  clientSessionId = null,
+  metadata = {},
+}) {
+  const questionRows = buildSessionQuestionRows(questions);
+  if (questionRows.length !== questions.length || questionRows.length === 0) {
+    throw new Error("The quiz question set is empty or contains invalid IDs");
+  }
+
+  const { data, error } = await admin.schema("public").rpc(
+    "create_quiz_session",
+    {
+      p_student_id: studentId,
+      p_class_id: classIdNum,
+      p_quiz_mode: quizMode,
+      p_launch_source: launchSource,
+      p_question_rows: questionRows,
+      p_lesson_id: lessonId,
+      p_focus_node_id: focusNodeId,
+      p_focus_topic_label: focusTopicLabel,
+      p_recommendation_snapshot_id: recommendationSnapshotId,
+      p_score_at_selection: scoreAtSelection,
+      p_client_session_id: clientSessionId,
+      p_metadata: metadata,
+    },
+  );
+
+  if (error) throw new Error(error.message);
+  if (!data) throw new Error("Quiz session creation returned no session ID");
+  return String(data);
+}
+
+app.post("/user/quiz-sessions/start", async (req, res) => {
+  try {
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser();
+    if (userError || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const classIdNum = Number(req.body?.class_id);
+    const quizMode = normalizeQuizMode(req.body?.quiz_mode);
+    if (!Number.isFinite(classIdNum) || !quizMode) {
+      return res.status(400).json({
+        error: "class_id and a supported quiz_mode are required",
+      });
+    }
+
+    if (!(await validateQuizEnrollment(user.id, classIdNum))) {
+      return res.status(404).json({ error: "Not enrolled in this class" });
+    }
+
+    const launchSource = normalizeLaunchSource(
+      req.body?.launch_source,
+      quizMode,
+    );
+    const requestedCount = Number(req.body?.num_questions);
+    const questionCount =
+      Number.isFinite(requestedCount) && requestedCount > 0
+        ? Math.min(15, Math.floor(requestedCount))
+        : 10;
+    const clientSessionId =
+      typeof req.body?.client_session_id === "string" &&
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(
+        req.body.client_session_id,
+      )
+        ? req.body.client_session_id
+        : null;
+
+    let questions = [];
+    let lessonId = null;
+    let focusNodeId = null;
+    let focusTopicLabel = null;
+    let recommendationSnapshot = null;
+    let scoreAtSelection = null;
+
+    if (quizMode === QUIZ_MODES.LESSON) {
+      lessonId = Number(req.body?.lesson_id);
+      if (!Number.isFinite(lessonId)) {
+        return res.status(400).json({ error: "lesson_id is required" });
+      }
+      questions = await buildLessonQuiz(classIdNum, lessonId);
+    } else {
+      let requestedTopic =
+        typeof req.body?.topic === "string" ? req.body.topic.trim() : "";
+
+      if (quizMode === QUIZ_MODES.DAILY_REVIEW) {
+        recommendationSnapshot = await findRecommendationSnapshot(
+          user.id,
+          classIdNum,
+          req.body?.recommendation_snapshot_id,
+        );
+        const recommended = getSortedReviewEntries(
+          recommendationSnapshot?.review_map_json,
+        )[0];
+        if (!recommended) {
+          return res.status(409).json({
+            error: "No personalized review recommendation is available yet",
+          });
+        }
+        requestedTopic = recommended.topic;
+        scoreAtSelection = recommended.score;
+      }
+
+      if (!requestedTopic) {
+        return res.status(400).json({ error: "topic is required" });
+      }
+
+      const topicQuiz = await buildTopicQuiz(
+        classIdNum,
+        requestedTopic,
+        questionCount,
+      );
+      questions = topicQuiz.questions;
+      focusNodeId = topicQuiz.topicContext.nodeId;
+      focusTopicLabel = topicQuiz.topicContext.topic;
+    }
+
+    if (questions.length === 0) {
+      return res.status(404).json({
+        error:
+          quizMode === QUIZ_MODES.LESSON
+            ? "This lesson has no questions"
+            : `No questions are available for ${focusTopicLabel || "this topic"}`,
+      });
+    }
+
+    const quizSessionId = await createUnifiedQuizSession({
+      studentId: user.id,
+      classIdNum,
+      quizMode,
+      launchSource,
+      questions,
+      lessonId,
+      focusNodeId,
+      focusTopicLabel,
+      recommendationSnapshotId: recommendationSnapshot?.id ?? null,
+      scoreAtSelection,
+      clientSessionId,
+      metadata: {
+        selection_strategy:
+          quizMode === QUIZ_MODES.LESSON
+            ? "lesson_question_bank"
+            : "random_without_replacement",
+        requested_question_count: questionCount,
+      },
+    });
+
+    return res.status(201).json({
+      quiz_session_id: quizSessionId,
+      quiz_mode: quizMode,
+      status: "in_progress",
+      class_id: classIdNum,
+      lesson_id: lessonId,
+      topic: focusTopicLabel,
+      focus_node_id: focusNodeId,
+      recommendation_snapshot_id: recommendationSnapshot?.id ?? null,
+      questions,
+    });
+  } catch (error) {
+    console.error("/user/quiz-sessions/start error:", error);
+    return res
+      .status(Number(error?.status) || 500)
+      .json({ error: error?.message || "Server error" });
+  }
+});
+
+app.post("/user/quiz-sessions/:sessionId/complete", async (req, res) => {
+  try {
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser();
+    if (userError || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const quizSessionId = String(req.params.sessionId || "").trim();
+    const { data: existingSession, error: existingSessionError } = await admin
+      .schema("public")
+      .from("quiz_sessions")
+      .select("*")
+      .eq("id", quizSessionId)
+      .maybeSingle();
+
+    if (existingSessionError) {
+      return res.status(500).json({ error: existingSessionError.message });
+    }
+    if (!existingSession) {
+      return res.status(404).json({ error: "Quiz session not found" });
+    }
+    if (String(existingSession.student_id) !== String(user.id)) {
+      return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const completion = validateCompletionCounts(
+      existingSession.question_count,
+      req.body?.answered_count,
+      req.body?.num_correct,
+    );
+    if (!completion.valid) {
+      return res.status(400).json({ error: completion.error });
+    }
+
+    const alreadyCompleted =
+      existingSession.status === "completed" && existingSession.completed_at;
+    if (!alreadyCompleted) {
+      const { error: completionError } = await admin.schema("public").rpc(
+        "complete_quiz_session",
+        {
+          p_session_id: quizSessionId,
+          p_student_id: user.id,
+          p_answered_count: completion.answered,
+          p_correct_count: completion.correct,
+        },
+      );
+
+      if (completionError) {
+        return res.status(400).json({ error: completionError.message });
+      }
+    }
+
+    let reviewSnapshotId = null;
+    let reviewSnapshotSaved = false;
+    let reviewSnapshotError = null;
+
+    if (!alreadyCompleted) {
+      try {
+        const review = await fetchReviewPrioritiesForStudent(
+          Number(existingSession.class_id),
+          user.id,
+        );
+        reviewSnapshotId = await persistReviewRecommendationSnapshot({
+          studentId: user.id,
+          classIdNum: Number(existingSession.class_id),
+          sourceQuizSessionId: quizSessionId,
+          sourceLessonId: existingSession.lesson_id,
+          review,
+          snapshotType:
+            existingSession.quiz_mode === QUIZ_MODES.LESSON
+              ? "post_lesson"
+              : "post_review_quiz",
+        });
+        reviewSnapshotSaved = true;
+      } catch (snapshotError) {
+        reviewSnapshotError =
+          snapshotError?.message || "Failed to persist post-quiz snapshot";
+        console.error("quiz-session completion snapshot error:", snapshotError);
+      }
+    }
+
+    const streak = await getStudyStreakSafe(
+      user.id,
+      Number(existingSession.class_id),
+      normalizeTimeZone(req.body?.timezone),
+    );
+
+    return res.status(200).json({
+      success: true,
+      already_completed: Boolean(alreadyCompleted),
+      quiz_session_id: quizSessionId,
+      quiz_mode: existingSession.quiz_mode,
+      review_snapshot_saved: reviewSnapshotSaved,
+      review_snapshot_id: reviewSnapshotId,
+      review_snapshot_error: reviewSnapshotError,
+      streak,
+    });
+  } catch (error) {
+    console.error("/user/quiz-sessions/:sessionId/complete error:", error);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
+app.post("/user/quiz-sessions/:sessionId/abandon", async (req, res) => {
+  try {
+    const supabase = createClient({ req, res });
+    const {
+      data: { user },
+      error: userError,
+    } = await supabase.auth.getUser();
+    if (userError || !user) {
+      return res.status(401).json({ error: "Not logged in." });
+    }
+
+    const quizSessionId = String(req.params.sessionId || "").trim();
+    if (!quizSessionId) {
+      return res.status(400).json({ error: "Quiz session ID is required" });
+    }
+
+    const { data: abandonedSession, error: abandonError } = await admin
+      .schema("public")
+      .rpc("abandon_quiz_session", {
+        p_session_id: quizSessionId,
+        p_student_id: user.id,
+      });
+
+    if (abandonError) {
+      const message = abandonError.message || "Quiz session could not be abandoned";
+      if (message.includes("not found")) {
+        return res.status(404).json({ error: message });
+      }
+      if (message.includes("does not belong")) {
+        return res.status(403).json({ error: "Forbidden" });
+      }
+      if (message.includes("completed") || message.includes("expired")) {
+        return res.status(409).json({ error: message });
+      }
+      return res.status(400).json({ error: message });
+    }
+
+    return res.status(200).json({
+      success: true,
+      quiz_session_id: quizSessionId,
+      status: abandonedSession?.status || "abandoned",
+      answered_count: Number(abandonedSession?.answered_count || 0),
+      correct_count: Number(abandonedSession?.correct_count || 0),
+      completed: false,
+    });
+  } catch (error) {
+    console.error("/user/quiz-sessions/:sessionId/abandon error:", error);
+    return res.status(500).json({ error: "Server error" });
+  }
+});
+
 app.post("/user/enrolled-class/:id/quiz", async (req, res) => {
   try {
     const { id } = req.params;
@@ -2078,14 +2876,34 @@ app.post("/user/enrolled-class/:id/quiz", async (req, res) => {
       return res.status(404).json({ error: "Not enrolled in this class" });
     }
 
-    // The client should pass the review map returned by GET /user/enrolled-class/:id/review
-    // Body: { review: { [topicLabel]: number }, num_questions?: number }
+    // Today can pass its recommended topic and Graph can pass a selected node.
+    // The older review-map shape remains supported for existing clients.
+    // Body: { topic?: string, review?: { [topicLabel]: number }, num_questions?: number }
     const review = req.body?.review;
-    const top = pickTopReviewTopic(review);
+    const requestedTopic =
+      typeof req.body?.topic === "string" ? req.body.topic.trim() : "";
+    let top = pickTopReviewTopic(review);
+
+    if (requestedTopic) {
+      const topicContext = await getClassTopicContext(
+        classIdNum,
+        requestedTopic,
+      );
+      if (!topicContext?.topic) {
+        return res.status(400).json({
+          error: "The requested topic is not part of this class knowledge graph",
+        });
+      }
+      top = {
+        topic: topicContext.topic,
+        score: Number(review?.[topicContext.topic]) || 0,
+      };
+    }
+
     if (!top) {
       return res
         .status(400)
-        .json({ error: "Missing or invalid review map in request body" });
+        .json({ error: "A valid topic or review map is required" });
     }
 
     const requestedN = Number(req.body?.num_questions);
@@ -2260,7 +3078,9 @@ app.post("/user/review-quiz-complete", async (req, res) => {
     const { data: existingSession, error: readErr } = await admin
       .schema("public")
       .from("review_quiz_sessions")
-      .select("id, student_id, num_questions, class_id")
+      .select(
+        "id, student_id, num_questions, class_id, status, completed_at",
+      )
       .eq("id", reviewQuizSessionId)
       .maybeSingle();
 
@@ -2274,6 +3094,23 @@ app.post("/user/review-quiz-complete", async (req, res) => {
 
     if (String(existingSession.student_id) !== String(user.id)) {
       return res.status(403).json({ error: "Forbidden" });
+    }
+
+    const completionTimeZone = normalizeTimeZone(req.body?.timezone);
+    if (
+      existingSession.status === "completed" &&
+      existingSession.completed_at
+    ) {
+      return res.status(200).json({
+        success: true,
+        already_completed: true,
+        review_quiz_session_id: reviewQuizSessionId,
+        streak: await getStudyStreakSafe(
+          user.id,
+          Number(existingSession.class_id),
+          completionTimeZone,
+        ),
+      });
     }
 
     const totalQuestions = Number(existingSession.num_questions);
@@ -2333,12 +3170,19 @@ app.post("/user/review-quiz-complete", async (req, res) => {
       reviewSnapshotError,
     });
 
+    const streak = await getStudyStreakSafe(
+      user.id,
+      Number(existingSession.class_id),
+      completionTimeZone,
+    );
+
     return res.status(200).json({
       success: true,
       review_quiz_session_id: reviewQuizSessionId,
       review_snapshot_saved: reviewSnapshotSaved,
       review_snapshot_id: reviewSnapshotId,
       review_snapshot_error: reviewSnapshotError,
+      streak,
     });
   } catch (e) {
     console.error("/user/review-quiz-complete error:", e);
