@@ -697,31 +697,34 @@ app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
     }
 
     // pull per student totals from node_schedule for this class
-    let totalsByLabel = new Map();
+    const totalsByNodeId = new Map();
+    const totalsByLabel = new Map();
     if (uid) {
       const { data: schedRows, error: schedErr } = await admin
         .schema("public")
         .from("leitner_schedule")
         .select(
-          "node_label, total_attempts, total_correct, last_reviewed, last_quiz_attempts, last_quiz_correct, next_review",
+          "node_id, node_label, total_attempts, total_correct, last_reviewed, last_quiz_attempts, last_quiz_correct, next_review",
         )
         .eq("class_id", classIdNum)
         .eq("student_id", uid);
 
       if (!schedErr && Array.isArray(schedRows)) {
         for (const r of schedRows) {
-          const key = String(r.node_label || "")
-            .trim()
-            .toLowerCase();
-          if (!key) continue;
-          totalsByLabel.set(key, {
+          const totals = {
             attempts: Number(r.total_attempts) || 0,
             correct: Number(r.total_correct) || 0,
             lastReviewed: r.last_reviewed ? String(r.last_reviewed) : null,
             lastQuizAttempts: Number(r.last_quiz_attempts) || 0,
             lastQuizCorrect: Number(r.last_quiz_correct) || 0,
             nextReview: r.next_review ? String(r.next_review) : null,
-          });
+          };
+          const nodeId = String(r.node_id || "").trim();
+          const labelKey = String(r.node_label || "")
+            .trim()
+            .toLowerCase();
+          if (nodeId) totalsByNodeId.set(nodeId, totals);
+          if (labelKey) totalsByLabel.set(labelKey, totals);
         }
       }
     }
@@ -758,7 +761,9 @@ app.get("/user/enrolled-class/:id/knowledge-graph", async (req, res) => {
         const cgOcc = 0;
 
         // override with per-student totals if present
-        const t = totalsByLabel.get(String(label).trim().toLowerCase());
+        const t =
+          totalsByNodeId.get(String(n.id)) ||
+          totalsByLabel.get(String(label).trim().toLowerCase());
         const occurrences = t ? Math.max(0, t.attempts) : 0;
         const correctResponses = t ? Math.max(0, t.correct) : 0;
 
@@ -1479,14 +1484,21 @@ app.post("/user/update-node-progress", async (req, res) => {
       const nodeLabel = String(topic || "").trim();
       if (!nodeLabel) continue;
 
+      const topicContext = await getClassTopicContext(class_id, nodeLabel);
+      const nodeId = topicContext?.nodeId || null;
+      const canonicalLabel = topicContext?.topic || nodeLabel;
+
       // read current row
-      const { data: existing, error: readErr } = await admin
+      let existingQuery = admin
         .from("leitner_schedule")
         .select("total_attempts, total_correct, box, streak")
         .eq("student_id", student_id)
-        .eq("class_id", class_id)
-        .eq("node_label", nodeLabel)
-        .maybeSingle();
+        .eq("class_id", class_id);
+      existingQuery = nodeId
+        ? existingQuery.eq("node_id", nodeId)
+        : existingQuery.eq("node_label", canonicalLabel);
+      const { data: existing, error: readErr } =
+        await existingQuery.maybeSingle();
 
       if (readErr) {
         console.error("[progress] read failed:", readErr);
@@ -1532,7 +1544,8 @@ app.post("/user/update-node-progress", async (req, res) => {
       const payload = {
         student_id,
         class_id,
-        node_label: nodeLabel,
+        node_id: nodeId,
+        node_label: canonicalLabel,
         total_attempts: nextAttempts,
         total_correct: nextCorrect,
         last_quiz_attempts: attDelta,
@@ -1545,7 +1558,11 @@ app.post("/user/update-node-progress", async (req, res) => {
 
       const { error: upsertErr } = await admin
         .from("leitner_schedule")
-        .upsert(payload, { onConflict: "student_id,class_id,node_label" });
+        .upsert(payload, {
+          onConflict: nodeId
+            ? "student_id,class_id,node_id"
+            : "student_id,class_id,node_label",
+        });
 
       if (upsertErr) {
         console.error("[progress] upsert failed:", upsertErr);
@@ -1742,18 +1759,18 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
 
   const idToLabel = new Map();
   for (const n of reactFlowNodes) {
-    const idNum = Number(n.id);
-    if (!Number.isFinite(idNum)) continue;
+    const nodeId = String(n?.id ?? "").trim();
+    if (!nodeId) continue;
     const label = n?.data?.label ?? String(n.id);
-    idToLabel.set(idNum, String(label));
+    idToLabel.set(nodeId, String(label));
   }
 
   const nodes = Array.from(idToLabel.values());
   const edges = [];
 
   for (const e of reactFlowEdges) {
-    const s = Number(e.source);
-    const t = Number(e.target);
+    const s = String(e?.source ?? "");
+    const t = String(e?.target ?? "");
     const sl = idToLabel.get(s);
     const tl = idToLabel.get(t);
     if (!sl || !tl) continue;
@@ -1764,7 +1781,7 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
     .schema("public")
     .from("leitner_schedule")
     .select(
-      "student_id, node_label, total_correct, total_attempts, last_quiz_correct, last_quiz_attempts, box, next_review, class_id",
+      "student_id, node_id, node_label, total_correct, total_attempts, last_quiz_correct, last_quiz_attempts, box, next_review, class_id",
     )
     .eq("class_id", classIdNum);
 
@@ -1776,9 +1793,11 @@ async function buildReviewInputsForStudent(classIdNum, studentId) {
   const currentStudentScheduleMeta = new Map();
 
   for (const row of performance || []) {
-    const { student_id, node_label, total_attempts, total_correct } = row;
+    const { student_id, node_id, node_label, total_attempts, total_correct } =
+      row;
     const sid = String(student_id);
-    const label = String(node_label || "").trim();
+    const label =
+      idToLabel.get(String(node_id || "")) || String(node_label || "").trim();
     if (!sid || !label) continue;
 
     if (!studentMap.has(sid)) {
@@ -2272,19 +2291,19 @@ app.get("/user/enrolled-class/:id/today", async (req, res) => {
     let recommendation = null;
 
     if (top) {
-      const [topicContext, scheduleResult] = await Promise.all([
-        getClassTopicContext(classIdNum, top.topic),
-        admin
-          .schema("public")
-          .from("leitner_schedule")
-          .select(
-            "box, next_review, last_reviewed, total_correct, total_attempts",
-          )
-          .eq("student_id", user.id)
-          .eq("class_id", classIdNum)
-          .eq("node_label", top.topic)
-          .maybeSingle(),
-      ]);
+      const topicContext = await getClassTopicContext(classIdNum, top.topic);
+      let scheduleQuery = admin
+        .schema("public")
+        .from("leitner_schedule")
+        .select(
+          "box, next_review, last_reviewed, total_correct, total_attempts",
+        )
+        .eq("student_id", user.id)
+        .eq("class_id", classIdNum);
+      scheduleQuery = topicContext?.nodeId
+        ? scheduleQuery.eq("node_id", topicContext.nodeId)
+        : scheduleQuery.eq("node_label", top.topic);
+      const scheduleResult = await scheduleQuery.maybeSingle();
       if (scheduleResult.error) throw new Error(scheduleResult.error.message);
 
       const nextReviewMs = scheduleResult.data?.next_review

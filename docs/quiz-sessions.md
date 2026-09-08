@@ -54,6 +54,12 @@ the streak can be recalculated.
 question as it was issued. New `student_question_answers` rows use
 `quiz_session_id` to connect response evidence to that set.
 
+`leitner_schedule.node_id` is the stable identity of the corresponding class
+graph node. `node_label` remains as a readable label snapshot and as a fallback
+for historical topics that cannot be matched to the current graph. Current
+graph, Today, completion, and abandonment paths prefer `node_id` so renaming a
+node does not disconnect its accumulated evidence.
+
 ## Migration and compatibility
 
 The migration is additive. It does not delete `student_lesson_sessions` or
@@ -75,6 +81,6 @@ supabase db push --dry-run
 supabase db push
 ```
 
-The next migration slice will move answer grading and Leitner updates into one
-transaction per submitted answer. Resume and expiration policies remain future
-work.
+Answers are persisted when submitted. Completed quizzes apply their topic
+totals before session completion; abandoned quizzes apply only the answers that
+were saved before exit. Resume and expiration policies remain future work.
