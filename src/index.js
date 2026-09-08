@@ -2824,13 +2824,18 @@ app.post("/user/quiz-sessions/start", async (req, res) => {
       recommendationSnapshotId: recommendationSnapshot?.id ?? null,
       scoreAtSelection,
       clientSessionId,
-      metadata: {
-        selection_strategy:
-          quizMode === QUIZ_MODES.LESSON
-            ? "lesson_question_bank"
-            : "random_without_replacement",
-        requested_question_count: questionCount,
-      },
+      metadata:
+        quizMode === QUIZ_MODES.LESSON
+          ? {
+              selection_strategy: "lesson_question_bank",
+              question_count_policy: "all_assigned",
+              selected_question_count: questions.length,
+            }
+          : {
+              selection_strategy: "random_without_replacement",
+              requested_question_count: questionCount,
+              selected_question_count: questions.length,
+            },
     });
 
     return res.status(201).json({

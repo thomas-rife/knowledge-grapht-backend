@@ -54,6 +54,11 @@ the streak can be recalculated.
 question as it was issued. New `student_question_answers` rows use
 `quiz_session_id` to connect response evidence to that set.
 
+Session metadata records question-selection provenance. Lesson quizzes use
+`question_count_policy: "all_assigned"` and `selected_question_count`; adaptive
+topic quizzes additionally retain the requested count because it constrains
+their random-without-replacement selection.
+
 `leitner_schedule.node_id` is the stable identity of the corresponding class
 graph node. `node_label` remains as a readable label snapshot and as a fallback
 for historical topics that cannot be matched to the current graph. Current
