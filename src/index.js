@@ -9,6 +9,7 @@ import {
 } from "./today.js";
 import {
   QUIZ_MODES,
+  buildSessionStreakSnapshot,
   buildSessionQuestionRows,
   normalizeLaunchSource,
   normalizeQuizMode,
@@ -2742,6 +2743,31 @@ app.post("/user/quiz-sessions/start", async (req, res) => {
         }
         requestedTopic = recommended.topic;
         scoreAtSelection = recommended.score;
+      } else if (req.body?.recommendation_snapshot_id) {
+        recommendationSnapshot = await findRecommendationSnapshot(
+          user.id,
+          classIdNum,
+          req.body.recommendation_snapshot_id,
+        );
+        if (!recommendationSnapshot) {
+          return res.status(400).json({
+            error: "The recommendation snapshot is unavailable",
+          });
+        }
+
+        const recommended = getSortedReviewEntries(
+          recommendationSnapshot.review_map_json,
+        ).find(
+          (entry) =>
+            entry.topic.toLocaleLowerCase() ===
+            requestedTopic.toLocaleLowerCase(),
+        );
+        if (!recommended) {
+          return res.status(400).json({
+            error: "The requested topic is not in this recommendation snapshot",
+          });
+        }
+        scoreAtSelection = recommended.score;
       }
 
       if (!requestedTopic) {
@@ -2847,6 +2873,15 @@ app.post("/user/quiz-sessions/:sessionId/complete", async (req, res) => {
 
     const alreadyCompleted =
       existingSession.status === "completed" && existingSession.completed_at;
+    const completionTimeZone = normalizeTimeZone(req.body?.timezone);
+    const streakBefore = alreadyCompleted
+      ? null
+      : await getStudyStreakSafe(
+          user.id,
+          Number(existingSession.class_id),
+          completionTimeZone,
+        );
+
     if (!alreadyCompleted) {
       const { error: completionError } = await admin.schema("public").rpc(
         "complete_quiz_session",
@@ -2860,6 +2895,31 @@ app.post("/user/quiz-sessions/:sessionId/complete", async (req, res) => {
 
       if (completionError) {
         return res.status(400).json({ error: completionError.message });
+      }
+    }
+
+    const streak = await getStudyStreakSafe(
+      user.id,
+      Number(existingSession.class_id),
+      completionTimeZone,
+    );
+
+    if (!alreadyCompleted) {
+      const streakSnapshot = buildSessionStreakSnapshot(streakBefore, streak);
+      if (streakSnapshot) {
+        const { error: streakSnapshotError } = await admin
+          .schema("public")
+          .from("quiz_sessions")
+          .update(streakSnapshot)
+          .eq("id", quizSessionId)
+          .eq("student_id", user.id);
+
+        if (streakSnapshotError) {
+          console.error(
+            "quiz-session streak snapshot error:",
+            streakSnapshotError,
+          );
+        }
       }
     }
 
@@ -2897,12 +2957,6 @@ app.post("/user/quiz-sessions/:sessionId/complete", async (req, res) => {
         console.error("quiz-session completion snapshot error:", snapshotError);
       }
     }
-
-    const streak = await getStudyStreakSafe(
-      user.id,
-      Number(existingSession.class_id),
-      normalizeTimeZone(req.body?.timezone),
-    );
 
     return res.status(200).json({
       success: true,

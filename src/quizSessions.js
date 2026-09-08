@@ -44,6 +44,25 @@ export function snapshotTypeForQuizMode(quizMode) {
   return null;
 }
 
+export function buildSessionStreakSnapshot(streakBefore, streakAfter) {
+  if (!streakBefore || !streakAfter) return null;
+
+  const nonnegativeInteger = (value) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? Math.max(0, Math.floor(parsed)) : 0;
+  };
+
+  return {
+    streak_previous_current: nonnegativeInteger(streakBefore?.current_streak),
+    streak_current: nonnegativeInteger(streakAfter.current_streak),
+    streak_longest: nonnegativeInteger(streakAfter.longest_streak),
+    streak_time_zone:
+      typeof streakAfter.time_zone === "string" && streakAfter.time_zone
+        ? streakAfter.time_zone
+        : "UTC",
+  };
+}
+
 export function buildSessionQuestionRows(questions) {
   if (!Array.isArray(questions)) return [];
 

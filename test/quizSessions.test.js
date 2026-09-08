@@ -4,6 +4,7 @@ import {
   QUIZ_MODES,
   SNAPSHOT_TYPES,
   buildSessionQuestionRows,
+  buildSessionStreakSnapshot,
   normalizeLaunchSource,
   normalizeQuizMode,
   snapshotTypeForQuizMode,
@@ -36,6 +37,34 @@ describe("Unified quiz-session contract", () => {
       SNAPSHOT_TYPES.POST_TOPIC_PRACTICE,
     );
     equal(snapshotTypeForQuizMode("legacy_review"), null);
+  });
+
+  it("freezes the before and after streak values on a completed session", () => {
+    deepEqual(
+      buildSessionStreakSnapshot(
+        { current_streak: 3 },
+        {
+          current_streak: 4,
+          longest_streak: 7,
+          time_zone: "America/Los_Angeles",
+        },
+      ),
+      {
+        streak_previous_current: 3,
+        streak_current: 4,
+        streak_longest: 7,
+        streak_time_zone: "America/Los_Angeles",
+      },
+    );
+    equal(buildSessionStreakSnapshot(null, null), null);
+    equal(
+      buildSessionStreakSnapshot(null, {
+        current_streak: 1,
+        longest_streak: 1,
+        time_zone: "UTC",
+      }),
+      null,
+    );
   });
 
   it("captures the issued question state for reproducible sessions", () => {

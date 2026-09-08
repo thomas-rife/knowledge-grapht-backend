@@ -1,5 +1,19 @@
 begin;
 
+alter table public.review_recommendation_snapshots
+  drop constraint if exists review_recommendation_snapshots_snapshot_type_check;
+
+alter table public.review_recommendation_snapshots
+  add constraint review_recommendation_snapshots_snapshot_type_check
+  check (
+    snapshot_type in (
+      'post_lesson',
+      'post_review_quiz',
+      'post_daily_review',
+      'post_topic_practice'
+    )
+  );
+
 update public.review_recommendation_snapshots as snapshot
 set snapshot_type = case session.quiz_mode
   when 'daily_review' then 'post_daily_review'

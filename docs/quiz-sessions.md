@@ -13,6 +13,11 @@ academic mode is stored separately from the UI surface that launched it:
 `launch_source` records attribution such as `today`, `lesson_screen`,
 `graph_node`, `notification`, or `resume`.
 
+`recommendation_snapshot_id` is the pre-quiz snapshot that selected a review
+quiz. This includes the primary daily review and secondary recommended topics
+launched from Today. A snapshot generated after any completed quiz links back
+through `review_recommendation_snapshots.source_quiz_session_id`.
+
 ## API contract
 
 Start any new quiz with `POST /user/quiz-sessions/start`. The request includes
@@ -34,7 +39,16 @@ recommendation snapshot whose `snapshot_type` identifies the completed mode:
 Abandon an unfinished quiz with `POST /user/quiz-sessions/:sessionId/abandon`.
 The server derives `answered_count` and `correct_count` from persisted answers,
 sets the session status to `abandoned`, and leaves `completed_at` empty. An
-abandoned session does not count toward the student's study streak.
+abandoned session does not count toward the student's study streak. Its saved
+answers do contribute to cumulative Leitner evidence for every tagged topic.
+Partial work can lower a topic's box, but it cannot promote one, and the topic
+is scheduled for review the following day.
+
+Completed sessions freeze the daily study streak seen immediately before and
+after completion in `streak_previous_current`, `streak_current`, and
+`streak_longest`. `streak_time_zone` records the IANA time zone used for those
+values. The underlying completed sessions remain the source of truth from which
+the streak can be recalculated.
 
 `quiz_session_questions` stores the ordered question set and a snapshot of each
 question as it was issued. New `student_question_answers` rows use
